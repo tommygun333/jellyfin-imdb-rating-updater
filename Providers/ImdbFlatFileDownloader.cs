@@ -12,7 +12,7 @@ public class ImdbFlatFileDownloader
 {
     private const string ImdbRatingsUrl = "https://datasets.imdbws.com/title.ratings.tsv.gz";
     private const long MaxDecompressedSize = 100 * 1024 * 1024; // 100 MB
-    private static readonly TimeSpan CacheMaxAge = TimeSpan.FromHours(23);
+    private static readonly TimeSpan CacheMaxAge = TimeSpan.FromHours(1);
 
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<ImdbFlatFileDownloader> _logger;
