@@ -6,14 +6,14 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Jellyfin.Plugin.ImdbRatings.Tests;
 
-public class OmdbApiClientTests
+public class ImdbGraphqlClientTests
 {
     [Fact]
     public async Task FetchRatingAsync_ReturnsParsedRatingAndVotes_WhenResponseIsValid()
     {
-        var client = CreateClient("""{"Response":"True","imdbRating":"7.8","imdbVotes":"12,345"}""");
+        var client = CreateClient("""{"data":{"title":{"ratingsSummary":{"aggregateRating":7.8,"voteCount":12345}}}}""");
 
-        var result = await client.FetchRatingAsync("tt1234567", "apikey", CancellationToken.None);
+        var result = await client.FetchRatingAsync("tt1234567", CancellationToken.None);
 
         Assert.True(result.HasValue);
         Assert.InRange(Math.Abs(result.Value.Rating - 7.8f), 0f, 0.0001f);
@@ -21,26 +21,36 @@ public class OmdbApiClientTests
     }
 
     [Fact]
-    public async Task FetchRatingAsync_ReturnsNull_WhenOmdbReturnsFalse()
+    public async Task FetchRatingAsync_ReturnsNull_WhenTitleIsNull()
     {
-        var client = CreateClient("""{"Response":"False","Error":"Movie not found!"}""");
+        var client = CreateClient("""{"data":{"title":null}}""");
 
-        var result = await client.FetchRatingAsync("tt0000001", "apikey", CancellationToken.None);
+        var result = await client.FetchRatingAsync("tt0000001", CancellationToken.None);
 
         Assert.Null(result);
     }
 
     [Fact]
-    public async Task FetchRatingAsync_ReturnsNull_WhenRatingIsNotAvailable()
+    public async Task FetchRatingAsync_ReturnsNull_WhenRatingSummaryIsNull()
     {
-        var client = CreateClient("""{"Response":"True","imdbRating":"N/A","imdbVotes":"N/A"}""");
+        var client = CreateClient("""{"data":{"title":{"ratingsSummary":null}}}""");
 
-        var result = await client.FetchRatingAsync("tt0000001", "apikey", CancellationToken.None);
+        var result = await client.FetchRatingAsync("tt0000001", CancellationToken.None);
 
         Assert.Null(result);
     }
 
-    private static OmdbApiClient CreateClient(string content, HttpStatusCode statusCode = HttpStatusCode.OK)
+    [Fact]
+    public async Task FetchRatingAsync_ReturnsNull_WhenResponseIsNotSuccess()
+    {
+        var client = CreateClient(string.Empty, HttpStatusCode.InternalServerError);
+
+        var result = await client.FetchRatingAsync("tt0000001", CancellationToken.None);
+
+        Assert.Null(result);
+    }
+
+    private static ImdbGraphqlClient CreateClient(string content, HttpStatusCode statusCode = HttpStatusCode.OK)
     {
         var handler = new StubHttpMessageHandler(_ => new HttpResponseMessage(statusCode)
         {
@@ -48,7 +58,7 @@ public class OmdbApiClientTests
         });
 
         var httpClientFactory = new StubHttpClientFactory(new HttpClient(handler));
-        return new OmdbApiClient(httpClientFactory, NullLogger<OmdbApiClient>.Instance);
+        return new ImdbGraphqlClient(httpClientFactory, NullLogger<ImdbGraphqlClient>.Instance);
     }
 
     private sealed class StubHttpClientFactory : IHttpClientFactory

@@ -9,16 +9,15 @@ public class PluginConfigurationTests
     {
         var config = new PluginConfiguration();
 
-        Assert.Equal(string.Empty, config.OmdbApiKey);
-        Assert.False(config.EnableOmdbFallback);
-        Assert.Equal(250, config.OmdbRequestDelayMs);
+        Assert.False(config.EnableImdbFallback);
+        Assert.Equal(250, config.ImdbFallbackRequestDelayMs);
         Assert.Equal(12, config.FlatFileCacheHours);
 
-        config.OmdbRequestDelayMs = -1;
-        Assert.Equal(0, config.OmdbRequestDelayMs);
+        config.ImdbFallbackRequestDelayMs = -1;
+        Assert.Equal(0, config.ImdbFallbackRequestDelayMs);
 
-        config.OmdbRequestDelayMs = 9000;
-        Assert.Equal(5000, config.OmdbRequestDelayMs);
+        config.ImdbFallbackRequestDelayMs = 9000;
+        Assert.Equal(5000, config.ImdbFallbackRequestDelayMs);
 
         config.FlatFileCacheHours = 0;
         Assert.Equal(1, config.FlatFileCacheHours);

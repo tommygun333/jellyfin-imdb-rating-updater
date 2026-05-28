@@ -9,6 +9,6 @@ public class ServiceRegistrator : IPluginServiceRegistrator
 {
     public void RegisterServices(IServiceCollection serviceCollection, IServerApplicationHost applicationHost)
     {
-        serviceCollection.AddSingleton<OmdbApiClient>();
+        serviceCollection.AddSingleton<ImdbGraphqlClient>();
     }
 }
