@@ -6,7 +6,7 @@ namespace Jellyfin.Plugin.ImdbRatings.Configuration;
 public class PluginConfiguration : BasePluginConfiguration
 {
     private int _minimumVotes = 1;
-    private int _omdbRequestDelayMs = 250;
+    private int _imdbFallbackRequestDelayMs = 250;
     private int _flatFileCacheHours = 12;
 
     public int MinimumVotes
@@ -21,14 +21,12 @@ public class PluginConfiguration : BasePluginConfiguration
 
     public bool EnableItemDebugLogging { get; set; } = false;
 
-    public string OmdbApiKey { get; set; } = string.Empty;
+    public bool EnableImdbFallback { get; set; } = false;
 
-    public bool EnableOmdbFallback { get; set; } = false;
-
-    public int OmdbRequestDelayMs
+    public int ImdbFallbackRequestDelayMs
     {
-        get => _omdbRequestDelayMs;
-        set => _omdbRequestDelayMs = Math.Clamp(value, 0, 5_000);
+        get => _imdbFallbackRequestDelayMs;
+        set => _imdbFallbackRequestDelayMs = Math.Clamp(value, 0, 5_000);
     }
 
     public int FlatFileCacheHours

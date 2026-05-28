@@ -64,33 +64,25 @@
                     </div>
 
                     <div class="verticalSection" style="margin-top: 2em;">
-                        <h2 class="sectionTitle">OMDb Fallback</h2>
+                        <h2 class="sectionTitle">IMDb Fallback</h2>
 
                         <div class="checkboxContainer checkboxContainer-withDescription">
                             <label>
-                                <input id="chkEnableOmdbFallback" type="checkbox" is="emby-checkbox" />
-                                <span>Enable OMDb API Fallback</span>
+                                <input id="chkEnableImdbFallback" type="checkbox" is="emby-checkbox" />
+                                <span>Enable IMDb Fallback</span>
                             </label>
                             <div class="fieldDescription checkboxFieldDescription">
                                 When an item's IMDb ID is not found in the flat file (e.g. newly released episodes),
-                                fetch its rating from the OMDb API instead.
+                                fetch its rating directly from the IMDb GraphQL API instead.
                             </div>
                         </div>
 
                         <div class="inputContainer">
-                            <label class="inputLabel" for="txtOmdbApiKey">OMDb API Key</label>
-                            <input id="txtOmdbApiKey" type="text" class="emby-input" />
-                            <div class="fieldDescription">
-                                Required for OMDb fallback. Get a free key at omdbapi.com (1,000 requests/day free).
-                            </div>
-                        </div>
-
-                        <div class="inputContainer">
-                            <label class="inputLabel" for="txtOmdbRequestDelayMs">OMDb Request Delay (ms)</label>
-                            <input id="txtOmdbRequestDelayMs" type="number" min="0" max="5000"
+                            <label class="inputLabel" for="txtImdbFallbackRequestDelayMs">IMDb Fallback Request Delay (ms)</label>
+                            <input id="txtImdbFallbackRequestDelayMs" type="number" min="0" max="5000"
                                    pattern="[0-9]*" required class="emby-input" />
                             <div class="fieldDescription">
-                                Delay between OMDb API requests to avoid rate limiting. Default: 250ms.
+                                Delay between IMDb fallback API requests to avoid rate limiting. Default: 250ms.
                             </div>
                         </div>
                     </div>
@@ -181,8 +173,8 @@
             return parsed;
         }
 
-        function getSanitizedOmdbRequestDelayMsInput() {
-            var parsed = parseInt(document.getElementById('txtOmdbRequestDelayMs').value, 10);
+        function getSanitizedImdbFallbackRequestDelayMsInput() {
+            var parsed = parseInt(document.getElementById('txtImdbFallbackRequestDelayMs').value, 10);
             if (!Number.isFinite(parsed)) {
                 return 250;
             }
@@ -213,11 +205,11 @@
                     flatFileCacheHours = 24;
                 }
 
-                var omdbRequestDelayMs = parseInt(getConfigValue(config, 'OmdbRequestDelayMs', 'omdbRequestDelayMs', 250), 10);
-                if (!Number.isFinite(omdbRequestDelayMs) || omdbRequestDelayMs < 0) {
-                    omdbRequestDelayMs = 250;
-                } else if (omdbRequestDelayMs > 5000) {
-                    omdbRequestDelayMs = 5000;
+                var imdbFallbackRequestDelayMs = parseInt(getConfigValue(config, 'ImdbFallbackRequestDelayMs', 'imdbFallbackRequestDelayMs', 250), 10);
+                if (!Number.isFinite(imdbFallbackRequestDelayMs) || imdbFallbackRequestDelayMs < 0) {
+                    imdbFallbackRequestDelayMs = 250;
+                } else if (imdbFallbackRequestDelayMs > 5000) {
+                    imdbFallbackRequestDelayMs = 5000;
                 }
 
                 document.getElementById('txtMinimumVotes').value = minimumVotes;
@@ -229,13 +221,12 @@
                     'EnableItemDebugLogging',
                     'enableItemDebugLogging',
                     false);
-                document.getElementById('chkEnableOmdbFallback').checked = !!getConfigValue(
+                document.getElementById('chkEnableImdbFallback').checked = !!getConfigValue(
                     config,
-                    'EnableOmdbFallback',
-                    'enableOmdbFallback',
+                    'EnableImdbFallback',
+                    'enableImdbFallback',
                     false);
-                document.getElementById('txtOmdbApiKey').value = getConfigValue(config, 'OmdbApiKey', 'omdbApiKey', '');
-                document.getElementById('txtOmdbRequestDelayMs').value = omdbRequestDelayMs;
+                document.getElementById('txtImdbFallbackRequestDelayMs').value = imdbFallbackRequestDelayMs;
                 Dashboard.hideLoadingMsg();
             }).catch(function () {
                 Dashboard.hideLoadingMsg();
@@ -262,19 +253,14 @@
                     document.getElementById('chkEnableItemDebugLogging').checked);
                 setConfigValue(
                     config,
-                    'EnableOmdbFallback',
-                    'enableOmdbFallback',
-                    document.getElementById('chkEnableOmdbFallback').checked);
+                    'EnableImdbFallback',
+                    'enableImdbFallback',
+                    document.getElementById('chkEnableImdbFallback').checked);
                 setConfigValue(
                     config,
-                    'OmdbApiKey',
-                    'omdbApiKey',
-                    document.getElementById('txtOmdbApiKey').value.trim());
-                setConfigValue(
-                    config,
-                    'OmdbRequestDelayMs',
-                    'omdbRequestDelayMs',
-                    getSanitizedOmdbRequestDelayMsInput());
+                    'ImdbFallbackRequestDelayMs',
+                    'imdbFallbackRequestDelayMs',
+                    getSanitizedImdbFallbackRequestDelayMsInput());
 
                 ApiClient.updatePluginConfiguration(ImdbRatingsConfig.pluginId, config).then(function (result) {
                     Dashboard.processPluginConfigurationUpdateResult(result);

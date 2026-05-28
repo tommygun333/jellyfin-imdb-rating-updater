@@ -20,7 +20,7 @@ public class RefreshImdbRatingsTask : IScheduledTask
 {
     private readonly ILibraryManager _libraryManager;
     private readonly IHttpClientFactory _httpClientFactory;
-    private readonly OmdbApiClient _omdbApiClient;
+    private readonly ImdbGraphqlClient _imdbGraphqlClient;
     private readonly ILogger<RefreshImdbRatingsTask> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly string _dataPath;
@@ -28,14 +28,14 @@ public class RefreshImdbRatingsTask : IScheduledTask
     public RefreshImdbRatingsTask(
         ILibraryManager libraryManager,
         IHttpClientFactory httpClientFactory,
-        OmdbApiClient omdbApiClient,
+        ImdbGraphqlClient imdbGraphqlClient,
         ILogger<RefreshImdbRatingsTask> logger,
         ILoggerFactory loggerFactory,
         MediaBrowser.Common.Configuration.IApplicationPaths applicationPaths)
     {
         _libraryManager = libraryManager;
         _httpClientFactory = httpClientFactory;
-        _omdbApiClient = omdbApiClient;
+        _imdbGraphqlClient = imdbGraphqlClient;
         _logger = logger;
         _loggerFactory = loggerFactory;
         _dataPath = applicationPaths.DataPath;
@@ -126,11 +126,11 @@ public class RefreshImdbRatingsTask : IScheduledTask
         int skippedBelowMinimumVotes = 0;
         int skippedUnchanged = 0;
         int notFound = 0;
-        var omdbFallbackItems = new List<(BaseItem Item, BaseItem? Parent, string ImdbId)>();
-        int omdbFound = 0;
-        int omdbNotFound = 0;
-        int omdbBelowMinimumVotes = 0;
-        int omdbUnchanged = 0;
+        var fallbackItems = new List<(BaseItem Item, BaseItem? Parent, string ImdbId)>();
+        int fallbackFound = 0;
+        int fallbackNotFound = 0;
+        int fallbackBelowMinimumVotes = 0;
+        int fallbackUnchanged = 0;
         const int debugSampleLimitPerCategory = 10;
         bool enableItemDebugLogging = config.EnableItemDebugLogging && _logger.IsEnabled(LogLevel.Debug);
         int loggedNotFoundDebugSamples = 0;
@@ -155,7 +155,7 @@ public class RefreshImdbRatingsTask : IScheduledTask
                     _logger.LogDebug("IMDb ID {ImdbId} not found in ratings file for \"{Name}\"", imdbId, item.Name);
                 }
                 notFound++;
-                omdbFallbackItems.Add((item, item.GetParent(), imdbId));
+                fallbackItems.Add((item, item.GetParent(), imdbId));
             }
             else if (ratingData.Votes < config.MinimumVotes)
             {
@@ -209,53 +209,53 @@ public class RefreshImdbRatingsTask : IScheduledTask
             }
         }
 
-        if (config.EnableOmdbFallback && !string.IsNullOrWhiteSpace(config.OmdbApiKey))
+        if (config.EnableImdbFallback)
         {
-            _logger.LogInformation("Looking up {Count} not-found items via OMDb fallback", omdbFallbackItems.Count);
+            _logger.LogInformation("Looking up {Count} not-found items via IMDb fallback", fallbackItems.Count);
 
-            for (int i = 0; i < omdbFallbackItems.Count; i++)
+            for (int i = 0; i < fallbackItems.Count; i++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                if (i > 0 && config.OmdbRequestDelayMs > 0)
+                if (i > 0 && config.ImdbFallbackRequestDelayMs > 0)
                 {
-                    await Task.Delay(config.OmdbRequestDelayMs, cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(config.ImdbFallbackRequestDelayMs, cancellationToken).ConfigureAwait(false);
                 }
 
-                var fallbackItem = omdbFallbackItems[i];
-                var omdbRating = await _omdbApiClient
-                    .FetchRatingAsync(fallbackItem.ImdbId, config.OmdbApiKey, cancellationToken)
+                var fallbackItem = fallbackItems[i];
+                var imdbRating = await _imdbGraphqlClient
+                    .FetchRatingAsync(fallbackItem.ImdbId, cancellationToken)
                     .ConfigureAwait(false);
 
-                if (!omdbRating.HasValue)
+                if (!imdbRating.HasValue)
                 {
-                    omdbNotFound++;
+                    fallbackNotFound++;
                     continue;
                 }
 
-                if (omdbRating.Value.Votes < config.MinimumVotes)
+                if (imdbRating.Value.Votes < config.MinimumVotes)
                 {
-                    omdbBelowMinimumVotes++;
+                    fallbackBelowMinimumVotes++;
                     continue;
                 }
 
                 if (fallbackItem.Item.CommunityRating.HasValue
-                    && Math.Abs(fallbackItem.Item.CommunityRating.Value - omdbRating.Value.Rating) < 0.01f)
+                    && Math.Abs(fallbackItem.Item.CommunityRating.Value - imdbRating.Value.Rating) < 0.01f)
                 {
-                    omdbUnchanged++;
+                    fallbackUnchanged++;
                     continue;
                 }
 
-                pendingUpdates.Add((fallbackItem.Item, fallbackItem.Parent, fallbackItem.Item.CommunityRating, omdbRating.Value.Rating));
-                omdbFound++;
+                pendingUpdates.Add((fallbackItem.Item, fallbackItem.Parent, fallbackItem.Item.CommunityRating, imdbRating.Value.Rating));
+                fallbackFound++;
             }
 
             _logger.LogInformation(
-                "OMDb fallback complete: {Found} found, {NotFound} not found, {BelowMinimum} below minimum votes, {Unchanged} unchanged",
-                omdbFound,
-                omdbNotFound,
-                omdbBelowMinimumVotes,
-                omdbUnchanged);
+                "IMDb fallback complete: {Found} found, {NotFound} not found, {BelowMinimum} below minimum votes, {Unchanged} unchanged",
+                fallbackFound,
+                fallbackNotFound,
+                fallbackBelowMinimumVotes,
+                fallbackUnchanged);
         }
 
         progress.Report(90);
