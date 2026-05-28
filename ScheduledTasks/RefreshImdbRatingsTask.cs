@@ -20,6 +20,7 @@ public class RefreshImdbRatingsTask : IScheduledTask
 {
     private readonly ILibraryManager _libraryManager;
     private readonly IHttpClientFactory _httpClientFactory;
+    private readonly OmdbApiClient _omdbApiClient;
     private readonly ILogger<RefreshImdbRatingsTask> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly string _dataPath;
@@ -27,12 +28,14 @@ public class RefreshImdbRatingsTask : IScheduledTask
     public RefreshImdbRatingsTask(
         ILibraryManager libraryManager,
         IHttpClientFactory httpClientFactory,
+        OmdbApiClient omdbApiClient,
         ILogger<RefreshImdbRatingsTask> logger,
         ILoggerFactory loggerFactory,
         MediaBrowser.Common.Configuration.IApplicationPaths applicationPaths)
     {
         _libraryManager = libraryManager;
         _httpClientFactory = httpClientFactory;
+        _omdbApiClient = omdbApiClient;
         _logger = logger;
         _loggerFactory = loggerFactory;
         _dataPath = applicationPaths.DataPath;
@@ -61,6 +64,7 @@ public class RefreshImdbRatingsTask : IScheduledTask
     public async Task ExecuteAsync(IProgress<double> progress, CancellationToken cancellationToken)
     {
         var config = Plugin.Instance?.Configuration ?? new PluginConfiguration();
+        var cacheMaxAge = TimeSpan.FromHours(config.FlatFileCacheHours);
 
         _logger.LogInformation("Starting IMDb ratings refresh (minVotes={MinVotes}, movies={Movies}, series={Series})",
             config.MinimumVotes, config.IncludeMovies, config.IncludeSeries);
@@ -110,6 +114,7 @@ public class RefreshImdbRatingsTask : IScheduledTask
             downloader,
             parser,
             libraryImdbIds,
+            cacheMaxAge,
             progress,
             cancellationToken).ConfigureAwait(false);
         progress.Report(30);
@@ -121,6 +126,11 @@ public class RefreshImdbRatingsTask : IScheduledTask
         int skippedBelowMinimumVotes = 0;
         int skippedUnchanged = 0;
         int notFound = 0;
+        var omdbFallbackItems = new List<(BaseItem Item, BaseItem? Parent, string ImdbId)>();
+        int omdbFound = 0;
+        int omdbNotFound = 0;
+        int omdbBelowMinimumVotes = 0;
+        int omdbUnchanged = 0;
         const int debugSampleLimitPerCategory = 10;
         bool enableItemDebugLogging = config.EnableItemDebugLogging && _logger.IsEnabled(LogLevel.Debug);
         int loggedNotFoundDebugSamples = 0;
@@ -145,6 +155,7 @@ public class RefreshImdbRatingsTask : IScheduledTask
                     _logger.LogDebug("IMDb ID {ImdbId} not found in ratings file for \"{Name}\"", imdbId, item.Name);
                 }
                 notFound++;
+                omdbFallbackItems.Add((item, item.GetParent(), imdbId));
             }
             else if (ratingData.Votes < config.MinimumVotes)
             {
@@ -196,6 +207,55 @@ public class RefreshImdbRatingsTask : IScheduledTask
                     suppressedBelowMinimumDebugLines,
                     debugSampleLimitPerCategory);
             }
+        }
+
+        if (config.EnableOmdbFallback && !string.IsNullOrWhiteSpace(config.OmdbApiKey))
+        {
+            _logger.LogInformation("Looking up {Count} not-found items via OMDb fallback", omdbFallbackItems.Count);
+
+            for (int i = 0; i < omdbFallbackItems.Count; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (i > 0 && config.OmdbRequestDelayMs > 0)
+                {
+                    await Task.Delay(config.OmdbRequestDelayMs, cancellationToken).ConfigureAwait(false);
+                }
+
+                var fallbackItem = omdbFallbackItems[i];
+                var omdbRating = await _omdbApiClient
+                    .FetchRatingAsync(fallbackItem.ImdbId, config.OmdbApiKey, cancellationToken)
+                    .ConfigureAwait(false);
+
+                if (!omdbRating.HasValue)
+                {
+                    omdbNotFound++;
+                    continue;
+                }
+
+                if (omdbRating.Value.Votes < config.MinimumVotes)
+                {
+                    omdbBelowMinimumVotes++;
+                    continue;
+                }
+
+                if (fallbackItem.Item.CommunityRating.HasValue
+                    && Math.Abs(fallbackItem.Item.CommunityRating.Value - omdbRating.Value.Rating) < 0.01f)
+                {
+                    omdbUnchanged++;
+                    continue;
+                }
+
+                pendingUpdates.Add((fallbackItem.Item, fallbackItem.Parent, fallbackItem.Item.CommunityRating, omdbRating.Value.Rating));
+                omdbFound++;
+            }
+
+            _logger.LogInformation(
+                "OMDb fallback complete: {Found} found, {NotFound} not found, {BelowMinimum} below minimum votes, {Unchanged} unchanged",
+                omdbFound,
+                omdbNotFound,
+                omdbBelowMinimumVotes,
+                omdbUnchanged);
         }
 
         progress.Report(90);
@@ -294,12 +354,13 @@ public class RefreshImdbRatingsTask : IScheduledTask
         ImdbFlatFileDownloader downloader,
         ImdbRatingsParser parser,
         IReadOnlySet<string> includeImdbIds,
+        TimeSpan cacheMaxAge,
         IProgress<double> progress,
         CancellationToken cancellationToken)
     {
         try
         {
-            var filePath = await GetRatingsFilePathWithTransientRetryAsync(downloader, cancellationToken).ConfigureAwait(false);
+            var filePath = await GetRatingsFilePathWithTransientRetryAsync(downloader, cacheMaxAge, cancellationToken).ConfigureAwait(false);
             progress.Report(10);
             return await parser.ParseFilteredAsync(filePath, includeImdbIds, cancellationToken).ConfigureAwait(false);
         }
@@ -314,6 +375,7 @@ public class RefreshImdbRatingsTask : IScheduledTask
                 downloader,
                 parser,
                 includeImdbIds,
+                cacheMaxAge,
                 progress,
                 cancellationToken).ConfigureAwait(false);
         }
@@ -323,12 +385,13 @@ public class RefreshImdbRatingsTask : IScheduledTask
         ImdbFlatFileDownloader downloader,
         ImdbRatingsParser parser,
         IReadOnlySet<string> includeImdbIds,
+        TimeSpan cacheMaxAge,
         IProgress<double> progress,
         CancellationToken cancellationToken)
     {
         try
         {
-            var filePath = await downloader.GetRatingsFilePathAsync(cancellationToken).ConfigureAwait(false);
+            var filePath = await downloader.GetRatingsFilePathAsync(cacheMaxAge, cancellationToken).ConfigureAwait(false);
             progress.Report(10);
             return await parser.ParseFilteredAsync(filePath, includeImdbIds, cancellationToken).ConfigureAwait(false);
         }
@@ -341,11 +404,12 @@ public class RefreshImdbRatingsTask : IScheduledTask
 
     private async Task<string> GetRatingsFilePathWithTransientRetryAsync(
         ImdbFlatFileDownloader downloader,
+        TimeSpan cacheMaxAge,
         CancellationToken cancellationToken)
     {
         try
         {
-            return await downloader.GetRatingsFilePathAsync(cancellationToken).ConfigureAwait(false);
+            return await downloader.GetRatingsFilePathAsync(cacheMaxAge, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (IsTransientNetworkError(ex))
         {
@@ -356,7 +420,7 @@ public class RefreshImdbRatingsTask : IScheduledTask
 
             try
             {
-                return await downloader.GetRatingsFilePathAsync(cancellationToken).ConfigureAwait(false);
+                return await downloader.GetRatingsFilePathAsync(cacheMaxAge, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception retryEx) when (IsTransientNetworkError(retryEx))
             {

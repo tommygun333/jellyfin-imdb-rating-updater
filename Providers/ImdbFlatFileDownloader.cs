@@ -12,7 +12,6 @@ public class ImdbFlatFileDownloader
 {
     private const string ImdbRatingsUrl = "https://datasets.imdbws.com/title.ratings.tsv.gz";
     private const long MaxDecompressedSize = 100 * 1024 * 1024; // 100 MB
-    private static readonly TimeSpan CacheMaxAge = TimeSpan.FromHours(1);
 
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<ImdbFlatFileDownloader> _logger;
@@ -35,9 +34,9 @@ public class ImdbFlatFileDownloader
 
     public bool HasCacheFile => File.Exists(_cachePath);
 
-    public async Task<string> GetRatingsFilePathAsync(CancellationToken cancellationToken)
+    public async Task<string> GetRatingsFilePathAsync(TimeSpan cacheMaxAge, CancellationToken cancellationToken)
     {
-        if (IsCacheFresh())
+        if (IsCacheFresh(cacheMaxAge))
         {
             _logger.LogInformation("IMDb ratings cache is fresh, skipping download");
             return _cachePath;
@@ -58,7 +57,7 @@ public class ImdbFlatFileDownloader
         return invalidated;
     }
 
-    private bool IsCacheFresh()
+    private bool IsCacheFresh(TimeSpan cacheMaxAge)
     {
         if (!File.Exists(_cachePath))
         {
@@ -66,7 +65,7 @@ public class ImdbFlatFileDownloader
         }
 
         var lastWrite = File.GetLastWriteTimeUtc(_cachePath);
-        return DateTime.UtcNow - lastWrite < CacheMaxAge;
+        return DateTime.UtcNow - lastWrite < cacheMaxAge;
     }
 
     private async Task DownloadAndDecompressAsync(CancellationToken cancellationToken)
