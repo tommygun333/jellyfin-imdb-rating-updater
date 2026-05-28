@@ -22,6 +22,15 @@
                             </div>
                         </div>
 
+                        <div class="inputContainer">
+                            <label class="inputLabel" for="txtFlatFileCacheHours">Flat File Cache Duration (hours)</label>
+                            <input id="txtFlatFileCacheHours" type="number" min="1" max="24"
+                                   pattern="[0-9]*" required class="emby-input" />
+                            <div class="fieldDescription">
+                                How often the IMDb ratings flat file is re-downloaded. 12 or 24 hours recommended.
+                            </div>
+                        </div>
+
                         <div class="checkboxContainer checkboxContainer-withDescription">
                             <label>
                                 <input id="chkIncludeMovies" type="checkbox" is="emby-checkbox" />
@@ -50,6 +59,38 @@
                             <div class="fieldDescription checkboxFieldDescription">
                                 Off by default. When enabled, writes sampled per-item debug logs for troubleshooting
                                 missing IMDb rows and minimum-vote skips (can increase log volume and task duration).
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="verticalSection" style="margin-top: 2em;">
+                        <h2 class="sectionTitle">OMDb Fallback</h2>
+
+                        <div class="checkboxContainer checkboxContainer-withDescription">
+                            <label>
+                                <input id="chkEnableOmdbFallback" type="checkbox" is="emby-checkbox" />
+                                <span>Enable OMDb API Fallback</span>
+                            </label>
+                            <div class="fieldDescription checkboxFieldDescription">
+                                When an item's IMDb ID is not found in the flat file (e.g. newly released episodes),
+                                fetch its rating from the OMDb API instead.
+                            </div>
+                        </div>
+
+                        <div class="inputContainer">
+                            <label class="inputLabel" for="txtOmdbApiKey">OMDb API Key</label>
+                            <input id="txtOmdbApiKey" type="text" class="emby-input" />
+                            <div class="fieldDescription">
+                                Required for OMDb fallback. Get a free key at omdbapi.com (1,000 requests/day free).
+                            </div>
+                        </div>
+
+                        <div class="inputContainer">
+                            <label class="inputLabel" for="txtOmdbRequestDelayMs">OMDb Request Delay (ms)</label>
+                            <input id="txtOmdbRequestDelayMs" type="number" min="0" max="5000"
+                                   pattern="[0-9]*" required class="emby-input" />
+                            <div class="fieldDescription">
+                                Delay between OMDb API requests to avoid rate limiting. Default: 250ms.
                             </div>
                         </div>
                     </div>
@@ -123,6 +164,40 @@
             return parsed;
         }
 
+        function getSanitizedFlatFileCacheHoursInput() {
+            var parsed = parseInt(document.getElementById('txtFlatFileCacheHours').value, 10);
+            if (!Number.isFinite(parsed)) {
+                return 12;
+            }
+
+            if (parsed < 1) {
+                return 1;
+            }
+
+            if (parsed > 24) {
+                return 24;
+            }
+
+            return parsed;
+        }
+
+        function getSanitizedOmdbRequestDelayMsInput() {
+            var parsed = parseInt(document.getElementById('txtOmdbRequestDelayMs').value, 10);
+            if (!Number.isFinite(parsed)) {
+                return 250;
+            }
+
+            if (parsed < 0) {
+                return 0;
+            }
+
+            if (parsed > 5000) {
+                return 5000;
+            }
+
+            return parsed;
+        }
+
         document.getElementById('ImdbRatingsConfigPage').addEventListener('pageshow', function () {
             Dashboard.showLoadingMsg();
             ApiClient.getPluginConfiguration(ImdbRatingsConfig.pluginId).then(function (config) {
@@ -131,7 +206,22 @@
                     minimumVotes = 1;
                 }
 
+                var flatFileCacheHours = parseInt(getConfigValue(config, 'FlatFileCacheHours', 'flatFileCacheHours', 12), 10);
+                if (!Number.isFinite(flatFileCacheHours) || flatFileCacheHours < 1) {
+                    flatFileCacheHours = 12;
+                } else if (flatFileCacheHours > 24) {
+                    flatFileCacheHours = 24;
+                }
+
+                var omdbRequestDelayMs = parseInt(getConfigValue(config, 'OmdbRequestDelayMs', 'omdbRequestDelayMs', 250), 10);
+                if (!Number.isFinite(omdbRequestDelayMs) || omdbRequestDelayMs < 0) {
+                    omdbRequestDelayMs = 250;
+                } else if (omdbRequestDelayMs > 5000) {
+                    omdbRequestDelayMs = 5000;
+                }
+
                 document.getElementById('txtMinimumVotes').value = minimumVotes;
+                document.getElementById('txtFlatFileCacheHours').value = flatFileCacheHours;
                 document.getElementById('chkIncludeMovies').checked = !!getConfigValue(config, 'IncludeMovies', 'includeMovies', true);
                 document.getElementById('chkIncludeSeries').checked = !!getConfigValue(config, 'IncludeSeries', 'includeSeries', true);
                 document.getElementById('chkEnableItemDebugLogging').checked = !!getConfigValue(
@@ -139,6 +229,13 @@
                     'EnableItemDebugLogging',
                     'enableItemDebugLogging',
                     false);
+                document.getElementById('chkEnableOmdbFallback').checked = !!getConfigValue(
+                    config,
+                    'EnableOmdbFallback',
+                    'enableOmdbFallback',
+                    false);
+                document.getElementById('txtOmdbApiKey').value = getConfigValue(config, 'OmdbApiKey', 'omdbApiKey', '');
+                document.getElementById('txtOmdbRequestDelayMs').value = omdbRequestDelayMs;
                 Dashboard.hideLoadingMsg();
             }).catch(function () {
                 Dashboard.hideLoadingMsg();
@@ -155,6 +252,7 @@
 
             ApiClient.getPluginConfiguration(ImdbRatingsConfig.pluginId).then(function (config) {
                 setConfigValue(config, 'MinimumVotes', 'minimumVotes', getSanitizedMinimumVotesInput());
+                setConfigValue(config, 'FlatFileCacheHours', 'flatFileCacheHours', getSanitizedFlatFileCacheHoursInput());
                 setConfigValue(config, 'IncludeMovies', 'includeMovies', document.getElementById('chkIncludeMovies').checked);
                 setConfigValue(config, 'IncludeSeries', 'includeSeries', document.getElementById('chkIncludeSeries').checked);
                 setConfigValue(
@@ -162,6 +260,21 @@
                     'EnableItemDebugLogging',
                     'enableItemDebugLogging',
                     document.getElementById('chkEnableItemDebugLogging').checked);
+                setConfigValue(
+                    config,
+                    'EnableOmdbFallback',
+                    'enableOmdbFallback',
+                    document.getElementById('chkEnableOmdbFallback').checked);
+                setConfigValue(
+                    config,
+                    'OmdbApiKey',
+                    'omdbApiKey',
+                    document.getElementById('txtOmdbApiKey').value.trim());
+                setConfigValue(
+                    config,
+                    'OmdbRequestDelayMs',
+                    'omdbRequestDelayMs',
+                    getSanitizedOmdbRequestDelayMsInput());
 
                 ApiClient.updatePluginConfiguration(ImdbRatingsConfig.pluginId, config).then(function (result) {
                     Dashboard.processPluginConfigurationUpdateResult(result);
