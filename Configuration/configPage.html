@@ -99,6 +99,71 @@
                     </div>
 
                     <div class="verticalSection" style="margin-top: 2em;">
+                        <h2 class="sectionTitle">Shoko / TMDB Integration (Anime)</h2>
+                        <p style="margin: 0.5em 0;">
+                            When enabled, anime items managed by <strong>Shoko Server</strong> that have an AniDB ID
+                            but no IMDb ID will be resolved automatically: AniDB &rarr; Shoko &rarr; TMDB &rarr; IMDb.
+                        </p>
+
+                        <div class="checkboxContainer checkboxContainer-withDescription">
+                            <label>
+                                <input id="chkEnableShokoResolution" type="checkbox" is="emby-checkbox" />
+                                <span>Enable Shoko Resolution</span>
+                            </label>
+                            <div class="fieldDescription checkboxFieldDescription">
+                                Look up IMDb IDs for anime items via Shoko Server and TMDB during the refresh task.
+                            </div>
+                        </div>
+
+                        <div class="inputContainer">
+                            <label class="inputLabel" for="txtShokoServerUrl">Shoko Server URL</label>
+                            <input id="txtShokoServerUrl" type="text" class="emby-input"
+                                   placeholder="http://localhost:8111" />
+                            <div class="fieldDescription">
+                                Base URL of your Shoko Server instance, e.g. <code>http://192.168.1.16:8111</code>.
+                            </div>
+                        </div>
+
+                        <div class="inputContainer">
+                            <label class="inputLabel" for="txtShokoApiKey">Shoko API Key</label>
+                            <input id="txtShokoApiKey" type="password" class="emby-input" autocomplete="off" />
+                            <div class="fieldDescription">
+                                API key for your Shoko Server instance.
+                            </div>
+                        </div>
+
+                        <div class="inputContainer">
+                            <label class="inputLabel" for="txtTmdbApiKey">TMDB API Key (v3)</label>
+                            <input id="txtTmdbApiKey" type="password" class="emby-input" autocomplete="off" />
+                            <div class="fieldDescription">
+                                Your TMDB API key (v3) used to look up IMDb IDs from TMDB show/movie IDs.
+                                Get one at <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">themoviedb.org</a>.
+                            </div>
+                        </div>
+
+                        <div class="inputContainer">
+                            <label class="inputLabel" for="txtTmdbRequestDelayMs">TMDB Request Delay (ms)</label>
+                            <input id="txtTmdbRequestDelayMs" type="number" min="0" max="5000"
+                                   pattern="[0-9]*" required class="emby-input" />
+                            <div class="fieldDescription">
+                                Delay between TMDB API requests to avoid rate limiting. Default: 250ms.
+                            </div>
+                        </div>
+
+                        <div class="checkboxContainer checkboxContainer-withDescription">
+                            <label>
+                                <input id="chkSaveResolvedIdsToMetadata" type="checkbox" is="emby-checkbox" />
+                                <span>Save Resolved IMDb IDs to Metadata</span>
+                            </label>
+                            <div class="fieldDescription checkboxFieldDescription">
+                                When enabled, resolved IMDb IDs are written back to each item's provider metadata
+                                so future scans pick them up automatically without calling Shoko or TMDB again.
+                                <strong>Disable during initial testing</strong> to avoid persisting incorrect IDs.
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="verticalSection" style="margin-top: 2em;">
                         <h2 class="sectionTitle">How It Works</h2>
                         <p style="margin: 0.5em 0;">
                             This plugin downloads the official IMDb ratings flat file daily and updates the
@@ -201,6 +266,23 @@
             return parsed;
         }
 
+        function getSanitizedTmdbRequestDelayMsInput() {
+            var parsed = parseInt(document.getElementById('txtTmdbRequestDelayMs').value, 10);
+            if (!Number.isFinite(parsed)) {
+                return 250;
+            }
+
+            if (parsed < 0) {
+                return 0;
+            }
+
+            if (parsed > 5000) {
+                return 5000;
+            }
+
+            return parsed;
+        }
+
         document.getElementById('ImdbRatingsConfigPage').addEventListener('pageshow', function () {
             Dashboard.showLoadingMsg();
             ApiClient.getPluginConfiguration(ImdbRatingsConfig.pluginId).then(function (config) {
@@ -243,6 +325,31 @@
                     'enableImdbFallback',
                     false);
                 document.getElementById('txtImdbFallbackRequestDelayMs').value = imdbFallbackRequestDelayMs;
+
+                var tmdbRequestDelayMs = parseInt(getConfigValue(config, 'TmdbRequestDelayMs', 'tmdbRequestDelayMs', 250), 10);
+                if (!Number.isFinite(tmdbRequestDelayMs) || tmdbRequestDelayMs < 0) {
+                    tmdbRequestDelayMs = 250;
+                } else if (tmdbRequestDelayMs > 5000) {
+                    tmdbRequestDelayMs = 5000;
+                }
+
+                document.getElementById('chkEnableShokoResolution').checked = !!getConfigValue(
+                    config,
+                    'EnableShokoResolution',
+                    'enableShokoResolution',
+                    false);
+                document.getElementById('txtShokoServerUrl').value = getConfigValue(
+                    config, 'ShokoServerUrl', 'shokoServerUrl', 'http://localhost:8111') || '';
+                document.getElementById('txtShokoApiKey').value = getConfigValue(
+                    config, 'ShokoApiKey', 'shokoApiKey', '') || '';
+                document.getElementById('txtTmdbApiKey').value = getConfigValue(
+                    config, 'TmdbApiKey', 'tmdbApiKey', '') || '';
+                document.getElementById('txtTmdbRequestDelayMs').value = tmdbRequestDelayMs;
+                document.getElementById('chkSaveResolvedIdsToMetadata').checked = !!getConfigValue(
+                    config,
+                    'SaveResolvedIdsToMetadata',
+                    'saveResolvedIdsToMetadata',
+                    false);
                 Dashboard.hideLoadingMsg();
             }).catch(function () {
                 Dashboard.hideLoadingMsg();
@@ -282,6 +389,36 @@
                     'ImdbFallbackRequestDelayMs',
                     'imdbFallbackRequestDelayMs',
                     getSanitizedImdbFallbackRequestDelayMsInput());
+                setConfigValue(
+                    config,
+                    'EnableShokoResolution',
+                    'enableShokoResolution',
+                    document.getElementById('chkEnableShokoResolution').checked);
+                setConfigValue(
+                    config,
+                    'ShokoServerUrl',
+                    'shokoServerUrl',
+                    document.getElementById('txtShokoServerUrl').value.trim());
+                setConfigValue(
+                    config,
+                    'ShokoApiKey',
+                    'shokoApiKey',
+                    document.getElementById('txtShokoApiKey').value);
+                setConfigValue(
+                    config,
+                    'TmdbApiKey',
+                    'tmdbApiKey',
+                    document.getElementById('txtTmdbApiKey').value);
+                setConfigValue(
+                    config,
+                    'TmdbRequestDelayMs',
+                    'tmdbRequestDelayMs',
+                    getSanitizedTmdbRequestDelayMsInput());
+                setConfigValue(
+                    config,
+                    'SaveResolvedIdsToMetadata',
+                    'saveResolvedIdsToMetadata',
+                    document.getElementById('chkSaveResolvedIdsToMetadata').checked);
 
                 ApiClient.updatePluginConfiguration(ImdbRatingsConfig.pluginId, config).then(function (result) {
                     Dashboard.processPluginConfigurationUpdateResult(result);
