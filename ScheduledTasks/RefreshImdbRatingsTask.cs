@@ -18,9 +18,14 @@ namespace Jellyfin.Plugin.ImdbRatings.ScheduledTasks;
 
 public class RefreshImdbRatingsTask : IScheduledTask
 {
+    // Shokofin stores TMDb IDs under "TheMovieDb" for series and "Tmdb" for movies/episodes.
+    // We check both so items from Shoko VFS libraries are discovered regardless of which key was used.
+    private static readonly string[] TmdbProviderKeys = ["TheMovieDb", "Tmdb"];
+
     private readonly ILibraryManager _libraryManager;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ImdbGraphqlClient _imdbGraphqlClient;
+    private readonly TmdbExternalIdsClient _tmdbExternalIdsClient;
     private readonly ILogger<RefreshImdbRatingsTask> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly string _dataPath;
@@ -29,6 +34,7 @@ public class RefreshImdbRatingsTask : IScheduledTask
         ILibraryManager libraryManager,
         IHttpClientFactory httpClientFactory,
         ImdbGraphqlClient imdbGraphqlClient,
+        TmdbExternalIdsClient tmdbExternalIdsClient,
         ILogger<RefreshImdbRatingsTask> logger,
         ILoggerFactory loggerFactory,
         MediaBrowser.Common.Configuration.IApplicationPaths applicationPaths)
@@ -36,6 +42,7 @@ public class RefreshImdbRatingsTask : IScheduledTask
         _libraryManager = libraryManager;
         _httpClientFactory = httpClientFactory;
         _imdbGraphqlClient = imdbGraphqlClient;
+        _tmdbExternalIdsClient = tmdbExternalIdsClient;
         _logger = logger;
         _loggerFactory = loggerFactory;
         _dataPath = applicationPaths.DataPath;
@@ -66,23 +73,33 @@ public class RefreshImdbRatingsTask : IScheduledTask
         var config = Plugin.Instance?.Configuration ?? new PluginConfiguration();
         var cacheMaxAge = TimeSpan.FromHours(config.FlatFileCacheHours);
 
-        _logger.LogInformation("Starting IMDb ratings refresh (minVotes={MinVotes}, movies={Movies}, series={Series}, otherLibraries={OtherLibraries})",
-            config.MinimumVotes, config.IncludeMovies, config.IncludeSeries, config.IncludeOtherLibraries);
+        _logger.LogInformation(
+            "Starting IMDb ratings refresh (minVotes={MinVotes}, movies={Movies}, series={Series}, otherLibraries={OtherLibraries}, tmdbResolution={TmdbResolution})",
+            config.MinimumVotes, config.IncludeMovies, config.IncludeSeries, config.IncludeOtherLibraries, config.EnableTmdbIdResolution);
 
-        // Step 1: Query library items and build a distinct IMDb ID filter set.
+        // Step 1: Query library items.
         progress.Report(0);
         var items = GetLibraryItems(config);
         if (items.Count == 0)
         {
-            _logger.LogInformation("Found 0 library items with IMDb IDs");
+            _logger.LogInformation("Found 0 library items eligible for IMDb rating updates");
             progress.Report(100);
             return;
         }
 
+        // Step 1b: For items without an IMDb ID, try to resolve one via TMDb if enabled.
+        // Maps item.Id → resolved IMDb ID for use throughout this task run.
+        var tmdbResolvedImdbIds = new Dictionary<Guid, string>();
+        if (config.EnableTmdbIdResolution && !string.IsNullOrWhiteSpace(config.TmdbApiKey))
+        {
+            await ResolveTmdbImdbIdsAsync(items, config, tmdbResolvedImdbIds, cancellationToken).ConfigureAwait(false);
+        }
+
+        // Build a distinct set of IMDb IDs from items (own or TMDb-resolved).
         var libraryImdbIds = new HashSet<string>(StringComparer.Ordinal);
         for (int i = 0; i < items.Count; i++)
         {
-            var imdbId = items[i].GetProviderId(MediaBrowser.Model.Entities.MetadataProvider.Imdb);
+            var imdbId = GetEffectiveImdbId(items[i], tmdbResolvedImdbIds);
             if (!string.IsNullOrWhiteSpace(imdbId))
             {
                 libraryImdbIds.Add(imdbId);
@@ -90,13 +107,16 @@ public class RefreshImdbRatingsTask : IScheduledTask
         }
 
         _logger.LogInformation(
-            "Found {ItemCount} library items with IMDb IDs ({DistinctIdCount} distinct IDs)",
+            "Found {ItemCount} library items ({DistinctIdCount} distinct IMDb IDs, {TmdbResolved} resolved from TMDb)",
             items.Count,
-            libraryImdbIds.Count);
+            libraryImdbIds.Count,
+            tmdbResolvedImdbIds.Count);
 
         if (libraryImdbIds.Count == 0)
         {
-            _logger.LogWarning("No valid IMDb IDs found on selected library items — nothing to update");
+            _logger.LogWarning(
+                "No valid IMDb IDs found on selected library items — nothing to update. " +
+                "If using Shoko Server, enable 'TMDb ID Resolution' in plugin settings and provide a TMDb API key.");
             progress.Report(100);
             return;
         }
@@ -141,7 +161,7 @@ public class RefreshImdbRatingsTask : IScheduledTask
             cancellationToken.ThrowIfCancellationRequested();
 
             var item = items[i];
-            var imdbId = item.GetProviderId(MediaBrowser.Model.Entities.MetadataProvider.Imdb);
+            var imdbId = GetEffectiveImdbId(item, tmdbResolvedImdbIds);
 
             if (string.IsNullOrEmpty(imdbId))
             {
@@ -350,6 +370,109 @@ public class RefreshImdbRatingsTask : IScheduledTask
             notFound);
     }
 
+    /// <summary>
+    /// Returns the effective IMDb ID for an item: its own ID if set, otherwise a TMDb-resolved one.
+    /// </summary>
+    private static string? GetEffectiveImdbId(BaseItem item, IReadOnlyDictionary<Guid, string> tmdbResolvedImdbIds)
+    {
+        var ownId = item.GetProviderId(MetadataProvider.Imdb);
+        if (!string.IsNullOrEmpty(ownId))
+        {
+            return ownId;
+        }
+
+        tmdbResolvedImdbIds.TryGetValue(item.Id, out var resolved);
+        return resolved;
+    }
+
+    /// <summary>
+    /// For every item in <paramref name="items"/> that has no IMDb ID but has a TMDb ID, calls the
+    /// TMDb external IDs API to resolve an IMDb ID and stores it in <paramref name="resolvedMap"/>.
+    /// </summary>
+    private async Task ResolveTmdbImdbIdsAsync(
+        IReadOnlyList<BaseItem> items,
+        PluginConfiguration config,
+        Dictionary<Guid, string> resolvedMap,
+        CancellationToken cancellationToken)
+    {
+        // Collect candidates: items that need resolution and have at least one TMDb key.
+        var candidates = new List<(BaseItem Item, string TmdbId, bool IsTvShow)>();
+        foreach (var item in items)
+        {
+            if (!string.IsNullOrEmpty(item.GetProviderId(MetadataProvider.Imdb)))
+            {
+                continue; // Already has IMDb ID — skip.
+            }
+
+            string? tmdbId = null;
+            foreach (var key in TmdbProviderKeys)
+            {
+                tmdbId = item.GetProviderId(key);
+                if (!string.IsNullOrEmpty(tmdbId))
+                {
+                    break;
+                }
+            }
+
+            if (string.IsNullOrEmpty(tmdbId))
+            {
+                continue; // No TMDb ID — cannot resolve.
+            }
+
+            // Episodes rarely have IMDb IDs in TMDb; skip them to avoid unnecessary API calls.
+            bool isTvShow = item is MediaBrowser.Controller.Entities.TV.Series
+                            || item is MediaBrowser.Controller.Entities.TV.Season;
+            bool isMovie = item is MediaBrowser.Controller.Entities.Movies.Movie;
+
+            if (!isTvShow && !isMovie)
+            {
+                continue;
+            }
+
+            candidates.Add((item, tmdbId, isTvShow));
+        }
+
+        if (candidates.Count == 0)
+        {
+            return;
+        }
+
+        _logger.LogInformation("Resolving IMDb IDs from TMDb for {Count} item(s) without IMDb IDs", candidates.Count);
+
+        int resolved = 0;
+        int notResolved = 0;
+
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (i > 0 && config.TmdbRequestDelayMs > 0)
+            {
+                await Task.Delay(config.TmdbRequestDelayMs, cancellationToken).ConfigureAwait(false);
+            }
+
+            var (item, tmdbId, isTvShow) = candidates[i];
+            var imdbId = await _tmdbExternalIdsClient
+                .FetchImdbIdAsync(tmdbId, isTvShow, config.TmdbApiKey, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (!string.IsNullOrEmpty(imdbId))
+            {
+                resolvedMap[item.Id] = imdbId;
+                resolved++;
+            }
+            else
+            {
+                notResolved++;
+            }
+        }
+
+        _logger.LogInformation(
+            "TMDb ID resolution complete: {Resolved} resolved, {NotResolved} not resolved",
+            resolved,
+            notResolved);
+    }
+
     private async Task<Dictionary<string, (float Rating, int Votes)>> DownloadAndParseWithRetryAsync(
         ImdbFlatFileDownloader downloader,
         ImdbRatingsParser parser,
@@ -453,33 +576,113 @@ public class RefreshImdbRatingsTask : IScheduledTask
             Recursive = true
         };
 
+        IReadOnlyList<BaseItem> items;
+
         // When IncludeOtherLibraries is enabled, skip item-type filtering entirely so that
         // all libraries (Anime, Mixed, etc.) are included alongside Movies and TV Shows.
         if (config.IncludeOtherLibraries)
         {
-            return _libraryManager.GetItemList(query);
+            items = _libraryManager.GetItemList(query);
         }
-
-        var includeTypes = new List<BaseItemKind>();
-        if (config.IncludeMovies)
+        else
         {
-            includeTypes.Add(BaseItemKind.Movie);
+            var includeTypes = new List<BaseItemKind>();
+            if (config.IncludeMovies)
+            {
+                includeTypes.Add(BaseItemKind.Movie);
+            }
+
+            if (config.IncludeSeries)
+            {
+                includeTypes.Add(BaseItemKind.Series);
+                includeTypes.Add(BaseItemKind.Episode);
+            }
+
+            if (includeTypes.Count == 0)
+            {
+                _logger.LogWarning("No library types selected — nothing to update");
+                return Array.Empty<BaseItem>();
+            }
+
+            query.IncludeItemTypes = includeTypes.ToArray();
+            items = _libraryManager.GetItemList(query);
         }
 
-        if (config.IncludeSeries)
+        // When TMDb ID resolution is enabled, also retrieve items that have a TMDb ID but no IMDb ID.
+        // Shokofin uses "TheMovieDb" for series and "Tmdb" for movies, so we query both keys.
+        if (config.EnableTmdbIdResolution && !string.IsNullOrWhiteSpace(config.TmdbApiKey))
         {
-            includeTypes.Add(BaseItemKind.Series);
-            includeTypes.Add(BaseItemKind.Episode);
+            var tmdbOnlyItems = GetTmdbOnlyItems(config);
+            if (tmdbOnlyItems.Count > 0)
+            {
+                var existingIds = new HashSet<Guid>(items.Select(i => i.Id));
+                var combined = new List<BaseItem>(items);
+                foreach (var tmdbItem in tmdbOnlyItems)
+                {
+                    if (existingIds.Add(tmdbItem.Id))
+                    {
+                        combined.Add(tmdbItem);
+                    }
+                }
+
+                return combined;
+            }
         }
 
-        if (includeTypes.Count == 0)
+        return items;
+    }
+
+    /// <summary>
+    /// Queries items that have a TMDb provider ID (either "TheMovieDb" or "Tmdb") but no IMDb ID.
+    /// These are typically items managed by Shoko/Shokofin in a VFS library.
+    /// </summary>
+    private List<BaseItem> GetTmdbOnlyItems(PluginConfiguration config)
+    {
+        BaseItemKind[]? typeFilter = null;
+        if (!config.IncludeOtherLibraries)
         {
-            _logger.LogWarning("No library types selected — nothing to update");
-            return Array.Empty<BaseItem>();
+            var types = new List<BaseItemKind>();
+            if (config.IncludeMovies) types.Add(BaseItemKind.Movie);
+            if (config.IncludeSeries)
+            {
+                types.Add(BaseItemKind.Series);
+                types.Add(BaseItemKind.Episode);
+            }
+
+            if (types.Count > 0)
+            {
+                typeFilter = types.ToArray();
+            }
         }
 
-        query.IncludeItemTypes = includeTypes.ToArray();
+        var result = new List<BaseItem>();
+        var seenIds = new HashSet<Guid>();
 
-        return _libraryManager.GetItemList(query);
+        foreach (var tmdbKey in TmdbProviderKeys)
+        {
+            var tmdbQuery = new InternalItemsQuery
+            {
+                HasAnyProviderId = new Dictionary<string, string> { { tmdbKey, string.Empty } },
+                IsVirtualItem = false,
+                Recursive = true
+            };
+
+            if (typeFilter is not null)
+            {
+                tmdbQuery.IncludeItemTypes = typeFilter;
+            }
+
+            var tmdbItems = _libraryManager.GetItemList(tmdbQuery);
+            foreach (var item in tmdbItems)
+            {
+                // Only add items that don't already have an IMDb ID (those are already in the main list).
+                if (seenIds.Add(item.Id) && string.IsNullOrEmpty(item.GetProviderId(MetadataProvider.Imdb)))
+                {
+                    result.Add(item);
+                }
+            }
+        }
+
+        return result;
     }
 }

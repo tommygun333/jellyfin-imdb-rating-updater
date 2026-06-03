@@ -10,5 +10,6 @@ public class ServiceRegistrator : IPluginServiceRegistrator
     public void RegisterServices(IServiceCollection serviceCollection, IServerApplicationHost applicationHost)
     {
         serviceCollection.AddSingleton<ImdbGraphqlClient>();
+        serviceCollection.AddSingleton<TmdbExternalIdsClient>();
     }
 }

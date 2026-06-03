@@ -8,6 +8,7 @@ public class PluginConfiguration : BasePluginConfiguration
     private int _minimumVotes = 1;
     private int _imdbFallbackRequestDelayMs = 250;
     private int _flatFileCacheHours = 12;
+    private int _tmdbRequestDelayMs = 0;
 
     public int MinimumVotes
     {
@@ -24,6 +25,16 @@ public class PluginConfiguration : BasePluginConfiguration
     public bool EnableItemDebugLogging { get; set; } = false;
 
     public bool EnableImdbFallback { get; set; } = false;
+
+    public bool EnableTmdbIdResolution { get; set; } = false;
+
+    public string TmdbApiKey { get; set; } = string.Empty;
+
+    public int TmdbRequestDelayMs
+    {
+        get => _tmdbRequestDelayMs;
+        set => _tmdbRequestDelayMs = Math.Clamp(value, 0, 5_000);
+    }
 
     public int ImdbFallbackRequestDelayMs
     {

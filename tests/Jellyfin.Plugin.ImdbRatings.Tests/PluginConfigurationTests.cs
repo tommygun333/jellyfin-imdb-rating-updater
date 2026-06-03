@@ -13,6 +13,9 @@ public class PluginConfigurationTests
         Assert.Equal(250, config.ImdbFallbackRequestDelayMs);
         Assert.Equal(12, config.FlatFileCacheHours);
         Assert.False(config.IncludeOtherLibraries);
+        Assert.False(config.EnableTmdbIdResolution);
+        Assert.Equal(string.Empty, config.TmdbApiKey);
+        Assert.Equal(0, config.TmdbRequestDelayMs);
 
         config.ImdbFallbackRequestDelayMs = -1;
         Assert.Equal(0, config.ImdbFallbackRequestDelayMs);
@@ -25,5 +28,11 @@ public class PluginConfigurationTests
 
         config.FlatFileCacheHours = 48;
         Assert.Equal(24, config.FlatFileCacheHours);
+
+        config.TmdbRequestDelayMs = -1;
+        Assert.Equal(0, config.TmdbRequestDelayMs);
+
+        config.TmdbRequestDelayMs = 9000;
+        Assert.Equal(5000, config.TmdbRequestDelayMs);
     }
 }
