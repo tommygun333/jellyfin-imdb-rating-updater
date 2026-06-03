@@ -53,6 +53,17 @@
 
                         <div class="checkboxContainer checkboxContainer-withDescription">
                             <label>
+                                <input id="chkIncludeOtherLibraries" type="checkbox" is="emby-checkbox" />
+                                <span>Include Other Libraries</span>
+                            </label>
+                            <div class="fieldDescription checkboxFieldDescription">
+                                When enabled, update ratings for all items with an IMDb ID regardless of library type
+                                (e.g. Anime, Mixed content). This overrides the Movies and TV Series filters above.
+                            </div>
+                        </div>
+
+                        <div class="checkboxContainer checkboxContainer-withDescription">
+                            <label>
                                 <input id="chkEnableItemDebugLogging" type="checkbox" is="emby-checkbox" />
                                 <span>Enable Item Debug Logs</span>
                             </label>
@@ -216,6 +227,11 @@
                 document.getElementById('txtFlatFileCacheHours').value = flatFileCacheHours;
                 document.getElementById('chkIncludeMovies').checked = !!getConfigValue(config, 'IncludeMovies', 'includeMovies', true);
                 document.getElementById('chkIncludeSeries').checked = !!getConfigValue(config, 'IncludeSeries', 'includeSeries', true);
+                document.getElementById('chkIncludeOtherLibraries').checked = !!getConfigValue(
+                    config,
+                    'IncludeOtherLibraries',
+                    'includeOtherLibraries',
+                    false);
                 document.getElementById('chkEnableItemDebugLogging').checked = !!getConfigValue(
                     config,
                     'EnableItemDebugLogging',
@@ -246,6 +262,11 @@
                 setConfigValue(config, 'FlatFileCacheHours', 'flatFileCacheHours', getSanitizedFlatFileCacheHoursInput());
                 setConfigValue(config, 'IncludeMovies', 'includeMovies', document.getElementById('chkIncludeMovies').checked);
                 setConfigValue(config, 'IncludeSeries', 'includeSeries', document.getElementById('chkIncludeSeries').checked);
+                setConfigValue(
+                    config,
+                    'IncludeOtherLibraries',
+                    'includeOtherLibraries',
+                    document.getElementById('chkIncludeOtherLibraries').checked);
                 setConfigValue(
                     config,
                     'EnableItemDebugLogging',

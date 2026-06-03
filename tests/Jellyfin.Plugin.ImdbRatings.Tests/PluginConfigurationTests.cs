@@ -12,6 +12,7 @@ public class PluginConfigurationTests
         Assert.False(config.EnableImdbFallback);
         Assert.Equal(250, config.ImdbFallbackRequestDelayMs);
         Assert.Equal(12, config.FlatFileCacheHours);
+        Assert.False(config.IncludeOtherLibraries);
 
         config.ImdbFallbackRequestDelayMs = -1;
         Assert.Equal(0, config.ImdbFallbackRequestDelayMs);

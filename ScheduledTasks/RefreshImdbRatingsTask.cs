@@ -66,8 +66,8 @@ public class RefreshImdbRatingsTask : IScheduledTask
         var config = Plugin.Instance?.Configuration ?? new PluginConfiguration();
         var cacheMaxAge = TimeSpan.FromHours(config.FlatFileCacheHours);
 
-        _logger.LogInformation("Starting IMDb ratings refresh (minVotes={MinVotes}, movies={Movies}, series={Series})",
-            config.MinimumVotes, config.IncludeMovies, config.IncludeSeries);
+        _logger.LogInformation("Starting IMDb ratings refresh (minVotes={MinVotes}, movies={Movies}, series={Series}, otherLibraries={OtherLibraries})",
+            config.MinimumVotes, config.IncludeMovies, config.IncludeSeries, config.IncludeOtherLibraries);
 
         // Step 1: Query library items and build a distinct IMDb ID filter set.
         progress.Report(0);
@@ -452,6 +452,13 @@ public class RefreshImdbRatingsTask : IScheduledTask
             IsVirtualItem = false,
             Recursive = true
         };
+
+        // When IncludeOtherLibraries is enabled, skip item-type filtering entirely so that
+        // all libraries (Anime, Mixed, etc.) are included alongside Movies and TV Shows.
+        if (config.IncludeOtherLibraries)
+        {
+            return _libraryManager.GetItemList(query);
+        }
 
         var includeTypes = new List<BaseItemKind>();
         if (config.IncludeMovies)
