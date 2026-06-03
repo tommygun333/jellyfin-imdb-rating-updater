@@ -19,6 +19,8 @@ public class PluginConfiguration : BasePluginConfiguration
 
     public bool IncludeSeries { get; set; } = true;
 
+    public bool IncludeOtherLibraries { get; set; } = false;
+
     public bool EnableItemDebugLogging { get; set; } = false;
 
     public bool EnableImdbFallback { get; set; } = false;
