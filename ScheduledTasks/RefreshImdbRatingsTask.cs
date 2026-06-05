@@ -9,6 +9,8 @@ using Jellyfin.Data.Enums;
 using Jellyfin.Plugin.ImdbRatings.Configuration;
 using Jellyfin.Plugin.ImdbRatings.Providers;
 using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Entities.Movies;
+using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.Tasks;
@@ -21,6 +23,8 @@ public class RefreshImdbRatingsTask : IScheduledTask
     private readonly ILibraryManager _libraryManager;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ImdbGraphqlClient _imdbGraphqlClient;
+    private readonly ShokoClient _shokoClient;
+    private readonly TmdbExternalIdsClient _tmdbExternalIdsClient;
     private readonly ILogger<RefreshImdbRatingsTask> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly string _dataPath;
@@ -29,6 +33,8 @@ public class RefreshImdbRatingsTask : IScheduledTask
         ILibraryManager libraryManager,
         IHttpClientFactory httpClientFactory,
         ImdbGraphqlClient imdbGraphqlClient,
+        ShokoClient shokoClient,
+        TmdbExternalIdsClient tmdbExternalIdsClient,
         ILogger<RefreshImdbRatingsTask> logger,
         ILoggerFactory loggerFactory,
         MediaBrowser.Common.Configuration.IApplicationPaths applicationPaths)
@@ -36,6 +42,8 @@ public class RefreshImdbRatingsTask : IScheduledTask
         _libraryManager = libraryManager;
         _httpClientFactory = httpClientFactory;
         _imdbGraphqlClient = imdbGraphqlClient;
+        _shokoClient = shokoClient;
+        _tmdbExternalIdsClient = tmdbExternalIdsClient;
         _logger = logger;
         _loggerFactory = loggerFactory;
         _dataPath = applicationPaths.DataPath;
@@ -72,7 +80,19 @@ public class RefreshImdbRatingsTask : IScheduledTask
         // Step 1: Query library items and build a distinct IMDb ID filter set.
         progress.Report(0);
         var items = GetLibraryItems(config);
-        if (items.Count == 0)
+
+        // Step 1.5: Shoko resolution — find anime items with AniDB IDs but no IMDb IDs and
+        // resolve them via Shoko Server → TMDB → IMDb.
+        var shokoResolvedItems = new List<(BaseItem Item, BaseItem? Parent, string ImdbId)>();
+        if (config.EnableShokoResolution
+            && !string.IsNullOrWhiteSpace(config.ShokoServerUrl)
+            && !string.IsNullOrWhiteSpace(config.ShokoApiKey)
+            && !string.IsNullOrWhiteSpace(config.TmdbApiKey))
+        {
+            shokoResolvedItems = await ResolveShokoItemsAsync(config, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (items.Count == 0 && shokoResolvedItems.Count == 0)
         {
             _logger.LogInformation("Found 0 library items with IMDb IDs");
             progress.Report(100);
@@ -89,10 +109,16 @@ public class RefreshImdbRatingsTask : IScheduledTask
             }
         }
 
+        foreach (var (_, _, resolvedId) in shokoResolvedItems)
+        {
+            libraryImdbIds.Add(resolvedId);
+        }
+
         _logger.LogInformation(
-            "Found {ItemCount} library items with IMDb IDs ({DistinctIdCount} distinct IDs)",
-            items.Count,
-            libraryImdbIds.Count);
+            "Found {ItemCount} library items with IMDb IDs ({DistinctIdCount} distinct IDs, {ShokoCount} resolved via Shoko)",
+            items.Count + shokoResolvedItems.Count,
+            libraryImdbIds.Count,
+            shokoResolvedItems.Count);
 
         if (libraryImdbIds.Count == 0)
         {
@@ -258,6 +284,47 @@ public class RefreshImdbRatingsTask : IScheduledTask
                 fallbackUnchanged);
         }
 
+        // Step 4.5: Process Shoko-resolved items against the flat-file ratings.
+        if (shokoResolvedItems.Count > 0)
+        {
+            int shokoQueued = 0;
+            int shokoNotFound = 0;
+            int shokoSkipped = 0;
+
+            foreach (var (shokoItem, shokoParent, shokoImdbId) in shokoResolvedItems)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (!ratings.TryGetValue(shokoImdbId, out var ratingData))
+                {
+                    shokoNotFound++;
+                    continue;
+                }
+
+                if (ratingData.Votes < config.MinimumVotes)
+                {
+                    shokoSkipped++;
+                    continue;
+                }
+
+                var newRating = ratingData.Rating;
+                if (shokoItem.CommunityRating.HasValue && Math.Abs(shokoItem.CommunityRating.Value - newRating) < 0.01f)
+                {
+                    shokoSkipped++;
+                    continue;
+                }
+
+                pendingUpdates.Add((shokoItem, shokoParent, shokoItem.CommunityRating, newRating));
+                shokoQueued++;
+            }
+
+            _logger.LogInformation(
+                "Shoko-resolved items: {Queued} queued for update, {NotFound} IMDb ID not in ratings file, {Skipped} skipped",
+                shokoQueued,
+                shokoNotFound,
+                shokoSkipped);
+        }
+
         progress.Report(90);
 
         // Step 5: Apply ratings and batch save, grouped by parent and chunked
@@ -348,6 +415,190 @@ public class RefreshImdbRatingsTask : IScheduledTask
             skippedBelowMinimumVotes,
             skippedMissingImdbId,
             notFound);
+    }
+
+    /// <summary>
+    /// Finds items that have AniDB provider IDs but no IMDb IDs, then resolves IMDb IDs via
+    /// Shoko Server (AniDB → TMDB) and the TMDB external_ids API (TMDB → IMDb).
+    /// If <see cref="PluginConfiguration.SaveResolvedIdsToMetadata"/> is enabled the resolved
+    /// IMDb ID is persisted to the item so future scans skip this step automatically.
+    /// </summary>
+    private async Task<List<(BaseItem Item, BaseItem? Parent, string ImdbId)>> ResolveShokoItemsAsync(
+        PluginConfiguration config,
+        CancellationToken cancellationToken)
+    {
+        var result = new List<(BaseItem Item, BaseItem? Parent, string ImdbId)>();
+
+        // Query all Series, Episode and Movie items that lack an IMDb ID.
+        var query = new InternalItemsQuery
+        {
+            HasImdbId = false,
+            IsVirtualItem = false,
+            Recursive = true,
+            IncludeItemTypes = new[] { BaseItemKind.Series, BaseItemKind.Episode, BaseItemKind.Movie }
+        };
+
+        var candidates = _libraryManager.GetItemList(query);
+
+        // Keep only items that have an AniDB provider ID set by Shoko.
+        var anidbItems = candidates
+            .Where(item => !string.IsNullOrWhiteSpace(item.GetProviderId("AniDB")))
+            .ToList();
+
+        if (anidbItems.Count == 0)
+        {
+            _logger.LogInformation("Shoko resolution: no items found with AniDB IDs");
+            return result;
+        }
+
+        _logger.LogInformation(
+            "Shoko resolution: resolving IMDb IDs for {Count} items with AniDB IDs",
+            anidbItems.Count);
+
+        for (int i = 0; i < anidbItems.Count; i++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var item = anidbItems[i];
+            var anidbId = item.GetProviderId("AniDB")!;
+            var parent = item.GetParent();
+
+            // Apply a delay before each iteration (after the first) to respect TMDB rate limits.
+            if (i > 0 && config.TmdbRequestDelayMs > 0)
+            {
+                await Task.Delay(config.TmdbRequestDelayMs, cancellationToken).ConfigureAwait(false);
+            }
+
+            // Step A: Shoko → TMDB
+            ShokoTmdbIds? tmdbIds;
+            if (item is Episode)
+            {
+                tmdbIds = await _shokoClient
+                    .GetEpisodeTmdbIdsAsync(config.ShokoServerUrl, config.ShokoApiKey, anidbId, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                // Series and Movie items both map to a Shoko Series entry.
+                tmdbIds = await _shokoClient
+                    .GetSeriesTmdbIdsAsync(config.ShokoServerUrl, config.ShokoApiKey, anidbId, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            if (tmdbIds is null)
+            {
+                continue;
+            }
+
+            // Step B: TMDB → IMDb  (prefer Movie IDs for Movie items, Show IDs for everything else)
+            string? imdbId = null;
+
+            if (item is Movie)
+            {
+                foreach (var movieId in tmdbIds.MovieIds)
+                {
+                    imdbId = await _tmdbExternalIdsClient
+                        .GetImdbIdForMovieAsync(movieId, config.TmdbApiKey, cancellationToken)
+                        .ConfigureAwait(false);
+                    if (!string.IsNullOrWhiteSpace(imdbId))
+                    {
+                        break;
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(imdbId))
+                {
+                    foreach (var showId in tmdbIds.ShowIds)
+                    {
+                        imdbId = await _tmdbExternalIdsClient
+                            .GetImdbIdForShowAsync(showId, config.TmdbApiKey, cancellationToken)
+                            .ConfigureAwait(false);
+                        if (!string.IsNullOrWhiteSpace(imdbId))
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                foreach (var showId in tmdbIds.ShowIds)
+                {
+                    imdbId = await _tmdbExternalIdsClient
+                        .GetImdbIdForShowAsync(showId, config.TmdbApiKey, cancellationToken)
+                        .ConfigureAwait(false);
+                    if (!string.IsNullOrWhiteSpace(imdbId))
+                    {
+                        break;
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(imdbId))
+                {
+                    foreach (var movieId in tmdbIds.MovieIds)
+                    {
+                        imdbId = await _tmdbExternalIdsClient
+                            .GetImdbIdForMovieAsync(movieId, config.TmdbApiKey, cancellationToken)
+                            .ConfigureAwait(false);
+                        if (!string.IsNullOrWhiteSpace(imdbId))
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(imdbId))
+            {
+                _logger.LogDebug(
+                    "Shoko resolution: could not resolve IMDb ID for AniDB {AniDbId} ({Name})",
+                    anidbId,
+                    item.Name);
+                continue;
+            }
+
+            _logger.LogDebug(
+                "Shoko resolution: resolved {ImdbId} for AniDB {AniDbId} ({Name})",
+                imdbId,
+                anidbId,
+                item.Name);
+
+            // Step C: Optionally persist the resolved IMDb ID to the item's metadata.
+            if (config.SaveResolvedIdsToMetadata)
+            {
+                item.SetProviderId(MetadataProvider.Imdb, imdbId);
+                try
+                {
+                    await _libraryManager
+                        .UpdateItemAsync(item, parent, ItemUpdateType.MetadataEdit, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    _logger.LogDebug(
+                        "Shoko resolution: saved IMDb ID {ImdbId} to metadata for {Name}",
+                        imdbId,
+                        item.Name);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Shoko resolution: failed to save IMDb ID {ImdbId} to metadata for {Name}",
+                        imdbId,
+                        item.Name);
+                    // Revert the in-memory change so the item is not left in a half-saved state.
+                    item.ProviderIds.Remove("Imdb");
+                }
+            }
+
+            result.Add((item, parent, imdbId));
+        }
+
+        _logger.LogInformation(
+            "Shoko resolution complete: {Resolved} of {Total} AniDB items resolved to an IMDb ID",
+            result.Count,
+            anidbItems.Count);
+
+        return result;
     }
 
     private async Task<Dictionary<string, (float Rating, int Votes)>> DownloadAndParseWithRetryAsync(
