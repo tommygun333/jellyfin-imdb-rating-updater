@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -82,9 +83,17 @@ public class ShokoClient
                 return null;
             }
 
+            // Extract episode-level TMDB cross-references from the TMDB.Episodes section,
+            // which is populated when includeDataFrom=TMDB is requested for an episode endpoint.
+            var episodeCrossRefs = result?.TMDB?.Episodes
+                ?.Where(e => e.ShowId != 0 && e.EpisodeNumber > 0)
+                ?.Select(e => new ShokoTmdbEpisodeCrossRef(e.ShowId, e.SeasonNumber, e.EpisodeNumber))
+                ?.ToArray() ?? Array.Empty<ShokoTmdbEpisodeCrossRef>();
+
             return new ShokoTmdbIds(
                 tmdb.Show ?? Array.Empty<int>(),
-                tmdb.Movie ?? Array.Empty<int>());
+                tmdb.Movie ?? Array.Empty<int>(),
+                episodeCrossRefs);
         }
         catch (OperationCanceledException)
         {
@@ -101,6 +110,14 @@ public class ShokoClient
     {
         [JsonPropertyName("IDs")]
         public ShokoIds? IDs { get; set; }
+
+        /// <summary>
+        /// Full TMDB data section, populated when includeDataFrom=TMDB is requested.
+        /// Present on episode responses and contains cross-reference details including
+        /// season and episode numbers needed for per-episode IMDb resolution.
+        /// </summary>
+        [JsonPropertyName("TMDB")]
+        public ShokoTmdbData? TMDB { get; set; }
     }
 
     private sealed class ShokoIds
@@ -117,9 +134,33 @@ public class ShokoClient
         [JsonPropertyName("Movie")]
         public int[]? Movie { get; set; }
     }
+
+    private sealed class ShokoTmdbData
+    {
+        [JsonPropertyName("Episodes")]
+        public ShokoTmdbEpisodeData[]? Episodes { get; set; }
+    }
+
+    private sealed class ShokoTmdbEpisodeData
+    {
+        [JsonPropertyName("ShowID")]
+        public int ShowId { get; set; }
+
+        [JsonPropertyName("SeasonNumber")]
+        public int SeasonNumber { get; set; }
+
+        [JsonPropertyName("EpisodeNumber")]
+        public int EpisodeNumber { get; set; }
+    }
 }
 
 /// <summary>
-/// TMDB Show and Movie IDs returned by the Shoko Server API.
+/// TMDB Show and Movie IDs, plus per-episode cross-references, returned by the Shoko Server API.
 /// </summary>
-public sealed record ShokoTmdbIds(int[] ShowIds, int[] MovieIds);
+public sealed record ShokoTmdbIds(int[] ShowIds, int[] MovieIds, ShokoTmdbEpisodeCrossRef[] EpisodeCrossRefs);
+
+/// <summary>
+/// TMDB episode cross-reference data including the parent show ID and the episode's position
+/// within the show. Used to call the TMDB per-episode external_ids API.
+/// </summary>
+public sealed record ShokoTmdbEpisodeCrossRef(int ShowId, int SeasonNumber, int EpisodeNumber);

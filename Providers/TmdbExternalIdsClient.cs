@@ -34,6 +34,15 @@ public class TmdbExternalIdsClient
     }
 
     /// <summary>
+    /// Returns the IMDb ID for a specific TMDB TV episode, or null if not available.
+    /// </summary>
+    public Task<string?> GetImdbIdForEpisodeAsync(int tmdbShowId, int seasonNumber, int episodeNumber, string apiKey, CancellationToken cancellationToken)
+    {
+        var url = $"{TmdbBaseUrl}/tv/{tmdbShowId}/season/{seasonNumber}/episode/{episodeNumber}/external_ids";
+        return FetchImdbIdAsync(apiKey, $"TMDB episode S{seasonNumber:D2}E{episodeNumber:D2} of show {tmdbShowId}", url, cancellationToken);
+    }
+
+    /// <summary>
     /// Returns the IMDb ID for a TMDB movie, or null if not available.
     /// </summary>
     public Task<string?> GetImdbIdForMovieAsync(int tmdbMovieId, string apiKey, CancellationToken cancellationToken)
