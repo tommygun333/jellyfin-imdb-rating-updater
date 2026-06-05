@@ -455,6 +455,10 @@ public class RefreshImdbRatingsTask : IScheduledTask
             "Shoko resolution: resolving IMDb IDs for {Count} items with AniDB IDs",
             anidbItems.Count);
 
+        // Track parent Series items discovered during episode resolution so they can inherit
+        // the show-level IMDb ID.  Key = Series.Id, Value = (series item, its parent, TMDB show ID).
+        var parentSeriesFromEpisodes = new Dictionary<Guid, (BaseItem Series, BaseItem? SeriesParent, int TmdbShowId)>();
+
         for (int i = 0; i < anidbItems.Count; i++)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -490,7 +494,7 @@ public class RefreshImdbRatingsTask : IScheduledTask
                 continue;
             }
 
-            // Step B: TMDB → IMDb  (prefer Movie IDs for Movie items, Show IDs for everything else)
+            // Step B: TMDB → IMDb
             string? imdbId = null;
 
             if (item is Movie)
@@ -520,8 +524,45 @@ public class RefreshImdbRatingsTask : IScheduledTask
                     }
                 }
             }
+            else if (item is Episode)
+            {
+                // Episodes use per-episode TMDB cross-references to look up episode-specific
+                // IMDb IDs.  Using the show-level IMDb ID here would give every episode in the
+                // same show an identical rating, which is incorrect.
+                foreach (var crossRef in tmdbIds.EpisodeCrossRefs)
+                {
+                    imdbId = await _tmdbExternalIdsClient
+                        .GetImdbIdForEpisodeAsync(
+                            crossRef.ShowId,
+                            crossRef.SeasonNumber,
+                            crossRef.EpisodeNumber,
+                            config.TmdbApiKey,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    if (!string.IsNullOrWhiteSpace(imdbId))
+                    {
+                        break;
+                    }
+                }
+
+                // Regardless of whether we found an episode-specific IMDb ID, register
+                // the parent Series so it can inherit the show-level IMDb ID later.
+                if (parent is not null && string.IsNullOrWhiteSpace(parent.GetProviderId(MetadataProvider.Imdb)))
+                {
+                    // Prefer the ShowId from a cross-reference; fall back to IDs.TMDB.Show.
+                    var tmdbShowId = tmdbIds.EpisodeCrossRefs.Length > 0
+                        ? tmdbIds.EpisodeCrossRefs[0].ShowId
+                        : (tmdbIds.ShowIds.Length > 0 ? tmdbIds.ShowIds[0] : 0);
+
+                    if (tmdbShowId != 0)
+                    {
+                        parentSeriesFromEpisodes.TryAdd(parent.Id, (parent, parent.GetParent(), tmdbShowId));
+                    }
+                }
+            }
             else
             {
+                // Series item: resolve using the show-level TMDB ID.
                 foreach (var showId in tmdbIds.ShowIds)
                 {
                     imdbId = await _tmdbExternalIdsClient
@@ -570,7 +611,7 @@ public class RefreshImdbRatingsTask : IScheduledTask
                 try
                 {
                     await _libraryManager
-                        .UpdateItemAsync(item, parent, ItemUpdateType.MetadataEdit, cancellationToken)
+                        .UpdateItemAsync(item, parent!, ItemUpdateType.MetadataEdit, cancellationToken)
                         .ConfigureAwait(false);
 
                     _logger.LogDebug(
@@ -593,10 +634,83 @@ public class RefreshImdbRatingsTask : IScheduledTask
             result.Add((item, parent, imdbId));
         }
 
+        // Step D: Resolve show-level IMDb IDs for parent Series items discovered during episode
+        // processing.  These series lack AniDB IDs of their own (or were not in the anidbItems
+        // list), so they would otherwise never get a rating.  We inherit the show-level rating
+        // from the corresponding TMDB show, which is the correct rating for a series container.
+        var alreadyResolvedIds = new HashSet<Guid>(result.Select(r => r.Item.Id));
+        int seriesInheritedCount = 0;
+
+        foreach (var (seriesId, (seriesItem, seriesParent, tmdbShowId)) in parentSeriesFromEpisodes)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // Skip if the series was already resolved in the main loop (it had its own AniDB ID).
+            if (alreadyResolvedIds.Contains(seriesId))
+            {
+                continue;
+            }
+
+            // Skip if the series already has an IMDb ID (e.g. set by SaveResolvedIdsToMetadata
+            // during the main loop for one of its episodes).
+            if (!string.IsNullOrWhiteSpace(seriesItem.GetProviderId(MetadataProvider.Imdb)))
+            {
+                continue;
+            }
+
+            if (config.TmdbRequestDelayMs > 0)
+            {
+                await Task.Delay(config.TmdbRequestDelayMs, cancellationToken).ConfigureAwait(false);
+            }
+
+            var showImdbId = await _tmdbExternalIdsClient
+                .GetImdbIdForShowAsync(tmdbShowId, config.TmdbApiKey, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (string.IsNullOrWhiteSpace(showImdbId))
+            {
+                _logger.LogDebug(
+                    "Shoko resolution: could not resolve show IMDb ID for parent series \"{Name}\" via TMDB show {TmdbShowId}",
+                    seriesItem.Name,
+                    tmdbShowId);
+                continue;
+            }
+
+            _logger.LogDebug(
+                "Shoko resolution: inherited show IMDb ID {ImdbId} for parent series \"{Name}\"",
+                showImdbId,
+                seriesItem.Name);
+
+            if (config.SaveResolvedIdsToMetadata)
+            {
+                seriesItem.SetProviderId(MetadataProvider.Imdb, showImdbId);
+                try
+                {
+                    await _libraryManager
+                        .UpdateItemAsync(seriesItem, seriesParent!, ItemUpdateType.MetadataEdit, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Shoko resolution: failed to save inherited IMDb ID {ImdbId} to metadata for series \"{Name}\"",
+                        showImdbId,
+                        seriesItem.Name);
+                    seriesItem.ProviderIds.Remove("Imdb");
+                    continue;
+                }
+            }
+
+            result.Add((seriesItem, seriesParent, showImdbId));
+            seriesInheritedCount++;
+        }
+
         _logger.LogInformation(
-            "Shoko resolution complete: {Resolved} of {Total} AniDB items resolved to an IMDb ID",
-            result.Count,
-            anidbItems.Count);
+            "Shoko resolution complete: {Resolved} of {Total} AniDB items resolved to an IMDb ID, {SeriesInherited} series inherited show-level rating",
+            result.Count - seriesInheritedCount,
+            anidbItems.Count,
+            seriesInheritedCount);
 
         return result;
     }
