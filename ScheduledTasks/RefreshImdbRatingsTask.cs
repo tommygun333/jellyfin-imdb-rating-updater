@@ -89,7 +89,7 @@ public class RefreshImdbRatingsTask : IScheduledTask
             && !string.IsNullOrWhiteSpace(config.ShokoApiKey)
             && !string.IsNullOrWhiteSpace(config.TmdbApiKey))
         {
-            shokoResolvedItems = await ResolveShokoItemsAsync(config, cancellationToken).ConfigureAwait(false);
+            shokoResolvedItems = await ResolveShokoItemsAsync(config, items, cancellationToken).ConfigureAwait(false);
         }
 
         if (items.Count == 0 && shokoResolvedItems.Count == 0)
@@ -418,24 +418,110 @@ public class RefreshImdbRatingsTask : IScheduledTask
     }
 
     /// <summary>
-    /// Finds items that have AniDB provider IDs but no IMDb IDs, then resolves IMDb IDs via
-    /// Shoko Server (AniDB → TMDB) and the TMDB external_ids API (TMDB → IMDb).
-    /// If <see cref="PluginConfiguration.SaveResolvedIdsToMetadata"/> is enabled the resolved
-    /// IMDb ID is persisted to the item so future scans skip this step automatically.
+    /// Finds anime items (those with AniDB provider IDs set by Shoko) that currently lack an
+    /// IMDb ID in Jellyfin, then resolves their IMDb IDs via Shoko Server → TMDB → IMDb.
+    /// <para>
+    /// Resolution results are cached in a persistent JSON file so that subsequent scans skip
+    /// the Shoko / TMDB round-trips for already-resolved entries.
+    /// </para>
+    /// <para>
+    /// When <see cref="PluginConfiguration.ForceRefreshAnimeImdbIds"/> is <c>true</c> the cache
+    /// is cleared, any previously saved IMDb IDs are stripped from Jellyfin metadata, and
+    /// all anime items are re-resolved.  The flag is reset to <c>false</c> automatically.
+    /// </para>
+    /// <para>
+    /// Key content-type disambiguation handled here:
+    /// <list type="bullet">
+    ///   <item><description>
+    ///     An <see cref="Episode"/> item whose AniDB episode entry maps to a TMDB <em>movie</em>
+    ///     (i.e. <c>MovieIds</c> is non-empty in the Shoko response) is treated as a movie and
+    ///     resolved via the TMDB movie external-IDs endpoint, not the per-episode endpoint.
+    ///     This handles Shoko's layout where standalone anime films appear as episodes inside a
+    ///     season/series container.
+    ///   </description></item>
+    ///   <item><description>
+    ///     <see cref="Season"/> items are queried and resolved the same way as <see cref="Series"/>
+    ///     items — trying TMDB show IDs first and falling back to TMDB movie IDs — because Shoko
+    ///     maps individual AniDB series (including films) to Jellyfin seasons.
+    ///   </description></item>
+    /// </list>
+    /// </para>
     /// </summary>
     private async Task<List<(BaseItem Item, BaseItem? Parent, string ImdbId)>> ResolveShokoItemsAsync(
         PluginConfiguration config,
+        IReadOnlyList<BaseItem> alreadyHaveImdbItems,
         CancellationToken cancellationToken)
     {
         var result = new List<(BaseItem Item, BaseItem? Parent, string ImdbId)>();
 
-        // Query all Series, Episode and Movie items that lack an IMDb ID.
+        // Load the persistent anime ID cache.
+        var cache = new AnimeIdCache(_dataPath, _logger);
+        await cache.LoadAsync(cancellationToken).ConfigureAwait(false);
+
+        // ── Force-refresh: clear cache and strip any previously saved IMDb IDs ────────────────
+        if (config.ForceRefreshAnimeImdbIds)
+        {
+            _logger.LogInformation(
+                "Shoko resolution: ForceRefreshAnimeImdbIds is enabled — clearing anime ID cache and stripping saved IMDb IDs from anime items");
+
+            cache.Clear();
+
+            // Strip IMDb IDs from anime items (those with AniDB IDs) that already have one
+            // saved in Jellyfin metadata so they are re-resolved fresh.
+            var strippingQuery = new InternalItemsQuery
+            {
+                HasImdbId = true,
+                IsVirtualItem = false,
+                Recursive = true,
+                IncludeItemTypes = new[]
+                {
+                    BaseItemKind.Series, BaseItemKind.Season, BaseItemKind.Episode, BaseItemKind.Movie
+                }
+            };
+
+            var itemsWithImdb = _libraryManager.GetItemList(strippingQuery)
+                .Where(item => !string.IsNullOrWhiteSpace(item.GetProviderId("AniDB")))
+                .ToList();
+
+            int strippedCount = 0;
+            foreach (var stripItem in itemsWithImdb)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                stripItem.ProviderIds.Remove("Imdb");
+                var stripParent = stripItem.GetParent();
+                try
+                {
+                    await _libraryManager
+                        .UpdateItemAsync(stripItem, stripParent!, ItemUpdateType.MetadataEdit, cancellationToken)
+                        .ConfigureAwait(false);
+                    strippedCount++;
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogWarning(ex, "Shoko resolution: failed to strip IMDb ID from {Name}", stripItem.Name);
+                }
+            }
+
+            _logger.LogInformation(
+                "Shoko resolution: stripped IMDb IDs from {Count} anime items", strippedCount);
+
+            // Reset the flag and persist the configuration so the next scan starts clean.
+            config.ForceRefreshAnimeImdbIds = false;
+            Plugin.Instance?.SaveConfiguration();
+        }
+
+        // ── Collect candidate items (those with AniDB IDs but no IMDb ID) ────────────────────
+        // Include Season so that Shoko-managed seasons (individual anime series/films grouped
+        // into a top-level series) are resolved in addition to Series, Episode, and Movie items.
         var query = new InternalItemsQuery
         {
             HasImdbId = false,
             IsVirtualItem = false,
             Recursive = true,
-            IncludeItemTypes = new[] { BaseItemKind.Series, BaseItemKind.Episode, BaseItemKind.Movie }
+            IncludeItemTypes = new[]
+            {
+                BaseItemKind.Series, BaseItemKind.Season, BaseItemKind.Episode, BaseItemKind.Movie
+            }
         };
 
         var candidates = _libraryManager.GetItemList(query);
@@ -448,16 +534,20 @@ public class RefreshImdbRatingsTask : IScheduledTask
         if (anidbItems.Count == 0)
         {
             _logger.LogInformation("Shoko resolution: no items found with AniDB IDs");
+            await cache.SaveAsync(cancellationToken).ConfigureAwait(false);
             return result;
         }
 
         _logger.LogInformation(
-            "Shoko resolution: resolving IMDb IDs for {Count} items with AniDB IDs",
+            "Shoko resolution: resolving IMDb IDs for {Count} anime items with AniDB IDs",
             anidbItems.Count);
 
-        // Track parent Series items discovered during episode resolution so they can inherit
-        // the show-level IMDb ID.  Key = Series.Id, Value = (series item, its parent, TMDB show ID).
-        var parentSeriesFromEpisodes = new Dictionary<Guid, (BaseItem Series, BaseItem? SeriesParent, int TmdbShowId)>();
+        // Track parent Series/Season items discovered during episode resolution so they can
+        // inherit the show-level IMDb ID.  Key = item.Id.
+        var parentContainersFromEpisodes =
+            new Dictionary<Guid, (BaseItem Container, BaseItem? ContainerParent, int TmdbShowId)>();
+
+        int cacheHits = 0;
 
         for (int i = 0; i < anidbItems.Count; i++)
         {
@@ -466,16 +556,58 @@ public class RefreshImdbRatingsTask : IScheduledTask
             var item = anidbItems[i];
             var anidbId = item.GetProviderId("AniDB")!;
             var parent = item.GetParent();
+            bool isEpisodeItem = item is Episode;
+            var cacheKey = isEpisodeItem ? AnimeIdCache.EpisodeKey(anidbId) : AnimeIdCache.SeriesKey(anidbId);
 
-            // Apply a delay before each iteration (after the first) to respect TMDB rate limits.
+            // ── Cache check ──────────────────────────────────────────────────────────────────
+            if (cache.TryGetEntry(cacheKey, out var cachedEntry) && cachedEntry is not null)
+            {
+                cacheHits++;
+
+                if (!string.IsNullOrWhiteSpace(cachedEntry.ImdbId))
+                {
+                    _logger.LogDebug(
+                        "Shoko resolution: cache hit — {ImdbId} for AniDB {AniDbId} ({Name}, {ContentType})",
+                        cachedEntry.ImdbId, anidbId, item.Name, cachedEntry.ContentType);
+
+                    if (config.SaveResolvedIdsToMetadata)
+                    {
+                        await PersistImdbIdAsync(item, parent, cachedEntry.ImdbId, cancellationToken).ConfigureAwait(false);
+                    }
+
+                    result.Add((item, parent, cachedEntry.ImdbId));
+
+                    // Register non-movie episodes' parent container even on a cache hit.
+                    if (isEpisodeItem && cachedEntry.ContentType != "movie" && parent is not null
+                        && string.IsNullOrWhiteSpace(parent.GetProviderId(MetadataProvider.Imdb)))
+                    {
+                        var cachedShowId = cachedEntry.TmdbShowIds.Length > 0 ? cachedEntry.TmdbShowIds[0] : 0;
+                        if (cachedShowId != 0)
+                        {
+                            parentContainersFromEpisodes.TryAdd(
+                                parent.Id, (parent, parent.GetParent(), cachedShowId));
+                        }
+                    }
+                }
+                else
+                {
+                    _logger.LogDebug(
+                        "Shoko resolution: cache hit (no IMDb ID resolved) for AniDB {AniDbId} ({Name})",
+                        anidbId, item.Name);
+                }
+
+                continue;
+            }
+
+            // Apply a delay before each API call (after the first) to respect TMDB rate limits.
             if (i > 0 && config.TmdbRequestDelayMs > 0)
             {
                 await Task.Delay(config.TmdbRequestDelayMs, cancellationToken).ConfigureAwait(false);
             }
 
-            // Step A: Shoko → TMDB
+            // ── Step A: Shoko → TMDB ─────────────────────────────────────────────────────────
             ShokoTmdbIds? tmdbIds;
-            if (item is Episode)
+            if (isEpisodeItem)
             {
                 tmdbIds = await _shokoClient
                     .GetEpisodeTmdbIdsAsync(config.ShokoServerUrl, config.ShokoApiKey, anidbId, cancellationToken)
@@ -483,7 +615,7 @@ public class RefreshImdbRatingsTask : IScheduledTask
             }
             else
             {
-                // Series and Movie items both map to a Shoko Series entry.
+                // Series, Season, and Movie items all map to a Shoko Series entry.
                 tmdbIds = await _shokoClient
                     .GetSeriesTmdbIdsAsync(config.ShokoServerUrl, config.ShokoApiKey, anidbId, cancellationToken)
                     .ConfigureAwait(false);
@@ -491,87 +623,116 @@ public class RefreshImdbRatingsTask : IScheduledTask
 
             if (tmdbIds is null)
             {
+                // Record a null cache entry so we don't re-query Shoko on the next scan.
+                cache.SetEntry(new AnimeIdCacheEntry
+                {
+                    Key = cacheKey,
+                    AniDbId = anidbId,
+                    ImdbId = null,
+                    ContentType = null,
+                    TmdbShowIds = Array.Empty<int>(),
+                    TmdbMovieIds = Array.Empty<int>(),
+                    ResolvedAt = DateTimeOffset.UtcNow
+                });
                 continue;
             }
 
-            // Step B: TMDB → IMDb
+            // ── Step B: TMDB → IMDb ──────────────────────────────────────────────────────────
             string? imdbId = null;
+            string contentType;
 
             if (item is Movie)
             {
+                // Jellyfin Movie items — try movie IDs first, show IDs as fallback.
+                contentType = "movie";
                 foreach (var movieId in tmdbIds.MovieIds)
                 {
                     imdbId = await _tmdbExternalIdsClient
                         .GetImdbIdForMovieAsync(movieId, config.TmdbApiKey, cancellationToken)
                         .ConfigureAwait(false);
-                    if (!string.IsNullOrWhiteSpace(imdbId))
-                    {
-                        break;
-                    }
+                    if (!string.IsNullOrWhiteSpace(imdbId)) break;
                 }
 
                 if (string.IsNullOrWhiteSpace(imdbId))
                 {
+                    contentType = "series";
                     foreach (var showId in tmdbIds.ShowIds)
                     {
                         imdbId = await _tmdbExternalIdsClient
                             .GetImdbIdForShowAsync(showId, config.TmdbApiKey, cancellationToken)
                             .ConfigureAwait(false);
-                        if (!string.IsNullOrWhiteSpace(imdbId))
-                        {
-                            break;
-                        }
+                        if (!string.IsNullOrWhiteSpace(imdbId)) break;
                     }
                 }
             }
-            else if (item is Episode)
+            else if (isEpisodeItem)
             {
-                // Episodes use per-episode TMDB cross-references to look up episode-specific
-                // IMDb IDs.  Using the show-level IMDb ID here would give every episode in the
-                // same show an identical rating, which is incorrect.
-                foreach (var crossRef in tmdbIds.EpisodeCrossRefs)
+                // Check whether this AniDB episode is actually a movie in Shoko's mapping.
+                // In Shoko's layout, standalone films grouped under a parent series appear as
+                // Episode items in Jellyfin.  When the Shoko response contains TMDB movie IDs,
+                // the entry is a movie — resolve it via the movie endpoint, not episode cross-refs.
+                if (tmdbIds.MovieIds.Length > 0)
                 {
-                    imdbId = await _tmdbExternalIdsClient
-                        .GetImdbIdForEpisodeAsync(
-                            crossRef.ShowId,
-                            crossRef.SeasonNumber,
-                            crossRef.EpisodeNumber,
-                            config.TmdbApiKey,
-                            cancellationToken)
-                        .ConfigureAwait(false);
-                    if (!string.IsNullOrWhiteSpace(imdbId))
+                    contentType = "movie";
+                    foreach (var movieId in tmdbIds.MovieIds)
                     {
-                        break;
+                        imdbId = await _tmdbExternalIdsClient
+                            .GetImdbIdForMovieAsync(movieId, config.TmdbApiKey, cancellationToken)
+                            .ConfigureAwait(false);
+                        if (!string.IsNullOrWhiteSpace(imdbId)) break;
                     }
                 }
-
-                // Regardless of whether we found an episode-specific IMDb ID, register
-                // the parent Series so it can inherit the show-level IMDb ID later.
-                if (parent is not null && string.IsNullOrWhiteSpace(parent.GetProviderId(MetadataProvider.Imdb)))
+                else
                 {
-                    // Prefer the ShowId from a cross-reference; fall back to IDs.TMDB.Show.
-                    var tmdbShowId = tmdbIds.EpisodeCrossRefs.Length > 0
-                        ? tmdbIds.EpisodeCrossRefs[0].ShowId
-                        : (tmdbIds.ShowIds.Length > 0 ? tmdbIds.ShowIds[0] : 0);
-
-                    if (tmdbShowId != 0)
+                    // Regular episode — use per-episode TMDB cross-references to get an
+                    // episode-specific IMDb ID rather than the show-level one.
+                    contentType = "episode";
+                    foreach (var crossRef in tmdbIds.EpisodeCrossRefs)
                     {
-                        parentSeriesFromEpisodes.TryAdd(parent.Id, (parent, parent.GetParent(), tmdbShowId));
+                        imdbId = await _tmdbExternalIdsClient
+                            .GetImdbIdForEpisodeAsync(
+                                crossRef.ShowId,
+                                crossRef.SeasonNumber,
+                                crossRef.EpisodeNumber,
+                                config.TmdbApiKey,
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                        if (!string.IsNullOrWhiteSpace(imdbId)) break;
+                    }
+
+                    // Register the parent container so it can inherit a show-level IMDb ID later.
+                    if (parent is not null && string.IsNullOrWhiteSpace(parent.GetProviderId(MetadataProvider.Imdb)))
+                    {
+                        var tmdbShowId = tmdbIds.EpisodeCrossRefs.Length > 0
+                            ? tmdbIds.EpisodeCrossRefs[0].ShowId
+                            : (tmdbIds.ShowIds.Length > 0 ? tmdbIds.ShowIds[0] : 0);
+
+                        if (tmdbShowId != 0)
+                        {
+                            parentContainersFromEpisodes.TryAdd(
+                                parent.Id, (parent, parent.GetParent(), tmdbShowId));
+                        }
                     }
                 }
             }
             else
             {
-                // Series item: resolve using the show-level TMDB ID.
-                foreach (var showId in tmdbIds.ShowIds)
+                // Series or Season item.  Try show IDs first; fall back to movie IDs for seasons
+                // that represent standalone films in Shoko's layout.
+                if (tmdbIds.ShowIds.Length > 0)
                 {
-                    imdbId = await _tmdbExternalIdsClient
-                        .GetImdbIdForShowAsync(showId, config.TmdbApiKey, cancellationToken)
-                        .ConfigureAwait(false);
-                    if (!string.IsNullOrWhiteSpace(imdbId))
+                    contentType = "series";
+                    foreach (var showId in tmdbIds.ShowIds)
                     {
-                        break;
+                        imdbId = await _tmdbExternalIdsClient
+                            .GetImdbIdForShowAsync(showId, config.TmdbApiKey, cancellationToken)
+                            .ConfigureAwait(false);
+                        if (!string.IsNullOrWhiteSpace(imdbId)) break;
                     }
+                }
+                else
+                {
+                    contentType = "movie";
                 }
 
                 if (string.IsNullOrWhiteSpace(imdbId))
@@ -581,80 +742,80 @@ public class RefreshImdbRatingsTask : IScheduledTask
                         imdbId = await _tmdbExternalIdsClient
                             .GetImdbIdForMovieAsync(movieId, config.TmdbApiKey, cancellationToken)
                             .ConfigureAwait(false);
-                        if (!string.IsNullOrWhiteSpace(imdbId))
-                        {
-                            break;
-                        }
+                        if (!string.IsNullOrWhiteSpace(imdbId)) break;
                     }
                 }
             }
+
+            // ── Store result in cache (even if imdbId is null) ───────────────────────────────
+            cache.SetEntry(new AnimeIdCacheEntry
+            {
+                Key = cacheKey,
+                AniDbId = anidbId,
+                ImdbId = string.IsNullOrWhiteSpace(imdbId) ? null : imdbId,
+                ContentType = contentType,
+                TmdbShowIds = tmdbIds.ShowIds,
+                TmdbMovieIds = tmdbIds.MovieIds,
+                ResolvedAt = DateTimeOffset.UtcNow
+            });
 
             if (string.IsNullOrWhiteSpace(imdbId))
             {
                 _logger.LogDebug(
                     "Shoko resolution: could not resolve IMDb ID for AniDB {AniDbId} ({Name})",
-                    anidbId,
-                    item.Name);
+                    anidbId, item.Name);
                 continue;
             }
 
             _logger.LogDebug(
-                "Shoko resolution: resolved {ImdbId} for AniDB {AniDbId} ({Name})",
-                imdbId,
-                anidbId,
-                item.Name);
+                "Shoko resolution: resolved {ImdbId} ({ContentType}) for AniDB {AniDbId} ({Name})",
+                imdbId, contentType, anidbId, item.Name);
 
-            // Step C: Optionally persist the resolved IMDb ID to the item's metadata.
+            // ── Step C: Optionally persist the resolved IMDb ID to the item's metadata ────────
             if (config.SaveResolvedIdsToMetadata)
             {
-                item.SetProviderId(MetadataProvider.Imdb, imdbId);
-                try
-                {
-                    await _libraryManager
-                        .UpdateItemAsync(item, parent!, ItemUpdateType.MetadataEdit, cancellationToken)
-                        .ConfigureAwait(false);
-
-                    _logger.LogDebug(
-                        "Shoko resolution: saved IMDb ID {ImdbId} to metadata for {Name}",
-                        imdbId,
-                        item.Name);
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    _logger.LogWarning(
-                        ex,
-                        "Shoko resolution: failed to save IMDb ID {ImdbId} to metadata for {Name}",
-                        imdbId,
-                        item.Name);
-                    // Revert the in-memory change so the item is not left in a half-saved state.
-                    item.ProviderIds.Remove("Imdb");
-                }
+                await PersistImdbIdAsync(item, parent, imdbId, cancellationToken).ConfigureAwait(false);
             }
 
             result.Add((item, parent, imdbId));
         }
 
-        // Step D: Resolve show-level IMDb IDs for parent Series items discovered during episode
-        // processing.  These series lack AniDB IDs of their own (or were not in the anidbItems
-        // list), so they would otherwise never get a rating.  We inherit the show-level rating
-        // from the corresponding TMDB show, which is the correct rating for a series container.
+        // ── Step D: Resolve show-level IMDb IDs for parent containers discovered during
+        //    episode processing.  These containers lack their own AniDB IDs (or were not in the
+        //    anidbItems list), so they would otherwise never get a rating.
         var alreadyResolvedIds = new HashSet<Guid>(result.Select(r => r.Item.Id));
-        int seriesInheritedCount = 0;
+        int containerInheritedCount = 0;
 
-        foreach (var (seriesId, (seriesItem, seriesParent, tmdbShowId)) in parentSeriesFromEpisodes)
+        foreach (var (containerId, (containerItem, containerParent, tmdbShowId)) in parentContainersFromEpisodes)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            // Skip if the series was already resolved in the main loop (it had its own AniDB ID).
-            if (alreadyResolvedIds.Contains(seriesId))
+            if (alreadyResolvedIds.Contains(containerId))
             {
                 continue;
             }
 
-            // Skip if the series already has an IMDb ID (e.g. set by SaveResolvedIdsToMetadata
-            // during the main loop for one of its episodes).
-            if (!string.IsNullOrWhiteSpace(seriesItem.GetProviderId(MetadataProvider.Imdb)))
+            if (!string.IsNullOrWhiteSpace(containerItem.GetProviderId(MetadataProvider.Imdb)))
             {
+                continue;
+            }
+
+            // Check cache for the container's inherited entry (keyed by Jellyfin ID since there
+            // may be no AniDB ID on this container).
+            var containerCacheKey = $"C:{containerId}";
+            if (cache.TryGetEntry(containerCacheKey, out var containerCached) && containerCached is not null)
+            {
+                if (!string.IsNullOrWhiteSpace(containerCached.ImdbId))
+                {
+                    if (config.SaveResolvedIdsToMetadata)
+                    {
+                        await PersistImdbIdAsync(containerItem, containerParent, containerCached.ImdbId, cancellationToken).ConfigureAwait(false);
+                    }
+
+                    result.Add((containerItem, containerParent, containerCached.ImdbId));
+                    containerInheritedCount++;
+                }
+
                 continue;
             }
 
@@ -667,52 +828,78 @@ public class RefreshImdbRatingsTask : IScheduledTask
                 .GetImdbIdForShowAsync(tmdbShowId, config.TmdbApiKey, cancellationToken)
                 .ConfigureAwait(false);
 
+            cache.SetEntry(new AnimeIdCacheEntry
+            {
+                Key = containerCacheKey,
+                AniDbId = string.Empty,
+                ImdbId = string.IsNullOrWhiteSpace(showImdbId) ? null : showImdbId,
+                ContentType = "series",
+                TmdbShowIds = new[] { tmdbShowId },
+                TmdbMovieIds = Array.Empty<int>(),
+                ResolvedAt = DateTimeOffset.UtcNow
+            });
+
             if (string.IsNullOrWhiteSpace(showImdbId))
             {
                 _logger.LogDebug(
-                    "Shoko resolution: could not resolve show IMDb ID for parent series \"{Name}\" via TMDB show {TmdbShowId}",
-                    seriesItem.Name,
-                    tmdbShowId);
+                    "Shoko resolution: could not resolve show IMDb ID for parent container \"{Name}\" via TMDB show {TmdbShowId}",
+                    containerItem.Name, tmdbShowId);
                 continue;
             }
 
             _logger.LogDebug(
-                "Shoko resolution: inherited show IMDb ID {ImdbId} for parent series \"{Name}\"",
-                showImdbId,
-                seriesItem.Name);
+                "Shoko resolution: inherited show IMDb ID {ImdbId} for parent container \"{Name}\"",
+                showImdbId, containerItem.Name);
 
             if (config.SaveResolvedIdsToMetadata)
             {
-                seriesItem.SetProviderId(MetadataProvider.Imdb, showImdbId);
-                try
-                {
-                    await _libraryManager
-                        .UpdateItemAsync(seriesItem, seriesParent!, ItemUpdateType.MetadataEdit, cancellationToken)
-                        .ConfigureAwait(false);
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    _logger.LogWarning(
-                        ex,
-                        "Shoko resolution: failed to save inherited IMDb ID {ImdbId} to metadata for series \"{Name}\"",
-                        showImdbId,
-                        seriesItem.Name);
-                    seriesItem.ProviderIds.Remove("Imdb");
-                    continue;
-                }
+                await PersistImdbIdAsync(containerItem, containerParent, showImdbId, cancellationToken).ConfigureAwait(false);
             }
 
-            result.Add((seriesItem, seriesParent, showImdbId));
-            seriesInheritedCount++;
+            result.Add((containerItem, containerParent, showImdbId));
+            containerInheritedCount++;
         }
 
         _logger.LogInformation(
-            "Shoko resolution complete: {Resolved} of {Total} AniDB items resolved to an IMDb ID, {SeriesInherited} series inherited show-level rating",
-            result.Count - seriesInheritedCount,
+            "Shoko resolution complete: {Resolved} of {Total} AniDB items resolved to an IMDb ID " +
+            "({CacheHits} from cache), {ContainerInherited} containers inherited show-level rating",
+            result.Count - containerInheritedCount,
             anidbItems.Count,
-            seriesInheritedCount);
+            cacheHits,
+            containerInheritedCount);
+
+        await cache.SaveAsync(cancellationToken).ConfigureAwait(false);
 
         return result;
+    }
+
+    /// <summary>
+    /// Persists a resolved IMDb ID to the item's provider metadata in Jellyfin.
+    /// If the save fails, the in-memory change is reverted.
+    /// </summary>
+    private async Task PersistImdbIdAsync(
+        BaseItem item,
+        BaseItem? parent,
+        string imdbId,
+        CancellationToken cancellationToken)
+    {
+        item.SetProviderId(MetadataProvider.Imdb, imdbId);
+        try
+        {
+            await _libraryManager
+                .UpdateItemAsync(item, parent!, ItemUpdateType.MetadataEdit, cancellationToken)
+                .ConfigureAwait(false);
+
+            _logger.LogDebug(
+                "Shoko resolution: saved IMDb ID {ImdbId} to metadata for {Name}", imdbId, item.Name);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(
+                ex,
+                "Shoko resolution: failed to save IMDb ID {ImdbId} to metadata for {Name}", imdbId, item.Name);
+            item.ProviderIds.Remove("Imdb");
+        }
     }
 
     private async Task<Dictionary<string, (float Rating, int Votes)>> DownloadAndParseWithRetryAsync(
@@ -834,6 +1021,7 @@ public class RefreshImdbRatingsTask : IScheduledTask
         if (config.IncludeSeries)
         {
             includeTypes.Add(BaseItemKind.Series);
+            includeTypes.Add(BaseItemKind.Season);
             includeTypes.Add(BaseItemKind.Episode);
         }
 

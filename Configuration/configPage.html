@@ -161,6 +161,20 @@
                                 <strong>Disable during initial testing</strong> to avoid persisting incorrect IDs.
                             </div>
                         </div>
+
+                        <div class="checkboxContainer checkboxContainer-withDescription">
+                            <label>
+                                <input id="chkForceRefreshAnimeImdbIds" type="checkbox" is="emby-checkbox" />
+                                <span>Force Re-Resolve All Anime IMDb IDs on Next Scan</span>
+                            </label>
+                            <div class="fieldDescription checkboxFieldDescription">
+                                When enabled, the plugin clears the anime ID cache and strips any previously saved
+                                anime IMDb IDs from Jellyfin metadata at the start of the next scan, then
+                                re-resolves them all from scratch via Shoko and TMDB.
+                                <strong>The option resets itself automatically after the scan</strong> — useful for
+                                correcting mistakes without having to manually clear metadata.
+                            </div>
+                        </div>
                     </div>
 
                     <div class="verticalSection" style="margin-top: 2em;">
@@ -350,6 +364,11 @@
                     'SaveResolvedIdsToMetadata',
                     'saveResolvedIdsToMetadata',
                     false);
+                document.getElementById('chkForceRefreshAnimeImdbIds').checked = !!getConfigValue(
+                    config,
+                    'ForceRefreshAnimeImdbIds',
+                    'forceRefreshAnimeImdbIds',
+                    false);
                 Dashboard.hideLoadingMsg();
             }).catch(function () {
                 Dashboard.hideLoadingMsg();
@@ -419,6 +438,11 @@
                     'SaveResolvedIdsToMetadata',
                     'saveResolvedIdsToMetadata',
                     document.getElementById('chkSaveResolvedIdsToMetadata').checked);
+                setConfigValue(
+                    config,
+                    'ForceRefreshAnimeImdbIds',
+                    'forceRefreshAnimeImdbIds',
+                    document.getElementById('chkForceRefreshAnimeImdbIds').checked);
 
                 ApiClient.updatePluginConfiguration(ImdbRatingsConfig.pluginId, config).then(function (result) {
                     Dashboard.processPluginConfigurationUpdateResult(result);

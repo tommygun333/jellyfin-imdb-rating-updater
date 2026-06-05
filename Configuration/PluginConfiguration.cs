@@ -60,4 +60,12 @@ public class PluginConfiguration : BasePluginConfiguration
         get => _tmdbRequestDelayMs;
         set => _tmdbRequestDelayMs = Math.Clamp(value, 0, 5_000);
     }
+
+    /// <summary>
+    /// When true, all cached anime IMDb IDs (both the plugin cache and any IMDb IDs previously
+    /// saved to Jellyfin metadata by <see cref="SaveResolvedIdsToMetadata"/>) are cleared at the
+    /// start of the next scan and re-resolved from scratch via Shoko and TMDB.
+    /// The flag is automatically reset to <c>false</c> after the scan completes.
+    /// </summary>
+    public bool ForceRefreshAnimeImdbIds { get; set; } = false;
 }
