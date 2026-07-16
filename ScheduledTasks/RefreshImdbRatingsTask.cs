@@ -147,16 +147,18 @@ public class RefreshImdbRatingsTask : IScheduledTask
         int lastScanProgressBucket = 30;
 
         // Step 4: Identify items that need rating updates (without mutating in-memory state)
-        var pendingUpdates = new List<(BaseItem Item, BaseItem? Parent, float? OldRating, float NewRating)>();
+        var pendingUpdates = new List<(BaseItem Item, BaseItem? Parent, float? OldRating, float? NewRating)>();
         int skippedMissingImdbId = 0;
         int skippedBelowMinimumVotes = 0;
         int skippedUnchanged = 0;
         int notFound = 0;
+        int noRatingDashApplied = 0;
         var fallbackItems = new List<(BaseItem Item, BaseItem? Parent, string ImdbId)>();
         int fallbackFound = 0;
         int fallbackNotFound = 0;
         int fallbackBelowMinimumVotes = 0;
         int fallbackUnchanged = 0;
+        var itemsToApplyDash = new HashSet<Guid>();
         const int debugSampleLimitPerCategory = 10;
         bool enableItemDebugLogging = config.EnableItemDebugLogging && _logger.IsEnabled(LogLevel.Debug);
         int loggedNotFoundDebugSamples = 0;
@@ -181,6 +183,8 @@ public class RefreshImdbRatingsTask : IScheduledTask
                     _logger.LogDebug("IMDb ID {ImdbId} not found in ratings file for \"{Name}\"", imdbId, item.Name);
                 }
                 notFound++;
+                // Track this item to apply dash (null rating) if fallback also doesn't find a rating
+                itemsToApplyDash.Add(item.Id);
                 fallbackItems.Add((item, item.GetParent(), imdbId));
             }
             else if (ratingData.Votes < config.MinimumVotes)
@@ -274,6 +278,8 @@ public class RefreshImdbRatingsTask : IScheduledTask
 
                 pendingUpdates.Add((fallbackItem.Item, fallbackItem.Parent, fallbackItem.Item.CommunityRating, imdbRating.Value.Rating));
                 fallbackFound++;
+                // Remove from dash set since we found a rating
+                itemsToApplyDash.Remove(fallbackItem.Item.Id);
             }
 
             _logger.LogInformation(
@@ -282,6 +288,31 @@ public class RefreshImdbRatingsTask : IScheduledTask
                 fallbackNotFound,
                 fallbackBelowMinimumVotes,
                 fallbackUnchanged);
+        }
+
+        // Apply dash (null rating) to items where no IMDb rating was found
+        if (itemsToApplyDash.Count > 0)
+        {
+            _logger.LogInformation("Applying dash rating to {Count} items with no IMDb rating found", itemsToApplyDash.Count);
+
+            for (int i = 0; i < items.Count; i++)
+            {
+                var item = items[i];
+                if (itemsToApplyDash.Contains(item.Id))
+                {
+                    // Check if the rating is already null/empty to avoid unnecessary updates
+                    if (item.CommunityRating.HasValue)
+                    {
+                        pendingUpdates.Add((item, item.GetParent(), item.CommunityRating, null));
+                        noRatingDashApplied++;
+                    }
+                }
+            }
+
+            if (noRatingDashApplied > 0)
+            {
+                _logger.LogInformation("Queued {Count} items for dash rating update", noRatingDashApplied);
+            }
         }
 
         // Step 4.5: Process Shoko-resolved items against the flat-file ratings.
@@ -408,8 +439,9 @@ public class RefreshImdbRatingsTask : IScheduledTask
         progress.Report(100);
         var skippedTotal = skippedMissingImdbId + skippedBelowMinimumVotes + skippedUnchanged;
         _logger.LogInformation(
-            "IMDb ratings refresh complete: {Updated} updated, {Skipped} skipped ({Unchanged} unchanged, {BelowMinimum} below minimum votes, {MissingImdbId} missing IMDb ID), {NotFound} not found in IMDb ratings",
+            "IMDb ratings refresh complete: {Updated} updated (including {DashApplied} with no rating), {Skipped} skipped ({Unchanged} unchanged, {BelowMinimum} below minimum votes, {MissingImdbId} missing IMDb ID), {NotFound} not found in IMDb ratings",
             pendingUpdates.Count,
+            noRatingDashApplied,
             skippedTotal,
             skippedUnchanged,
             skippedBelowMinimumVotes,
