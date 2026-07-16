@@ -147,16 +147,18 @@ public class RefreshImdbRatingsTask : IScheduledTask
         int lastScanProgressBucket = 30;
 
         // Step 4: Identify items that need rating updates (without mutating in-memory state)
-        var pendingUpdates = new List<(BaseItem Item, BaseItem? Parent, float? OldRating, float NewRating)>();
+        var pendingUpdates = new List<(BaseItem Item, BaseItem? Parent, float? OldRating, float? NewRating)>();
         int skippedMissingImdbId = 0;
         int skippedBelowMinimumVotes = 0;
         int skippedUnchanged = 0;
         int notFound = 0;
+        int noRatingDashApplied = 0;
         var fallbackItems = new List<(BaseItem Item, BaseItem? Parent, string ImdbId)>();
         int fallbackFound = 0;
         int fallbackNotFound = 0;
         int fallbackBelowMinimumVotes = 0;
         int fallbackUnchanged = 0;
+        var itemsToApplyDash = new HashSet<Guid>();
         const int debugSampleLimitPerCategory = 10;
         bool enableItemDebugLogging = config.EnableItemDebugLogging && _logger.IsEnabled(LogLevel.Debug);
         int loggedNotFoundDebugSamples = 0;
@@ -181,6 +183,8 @@ public class RefreshImdbRatingsTask : IScheduledTask
                     _logger.LogDebug("IMDb ID {ImdbId} not found in ratings file for \"{Name}\"", imdbId, item.Name);
                 }
                 notFound++;
+                // Track this item to apply dash (null rating) if fallback also doesn't find a rating
+                itemsToApplyDash.Add(item.Id);
                 fallbackItems.Add((item, item.GetParent(), imdbId));
             }
             else if (ratingData.Votes < config.MinimumVotes)
@@ -235,6 +239,12 @@ public class RefreshImdbRatingsTask : IScheduledTask
             }
         }
 
+        // Log diagnostic info about items not found in ratings file
+        _logger.LogInformation(
+            "Items not found in IMDb ratings file: {NotFoundCount}, EnableImdbFallback: {FallbackEnabled}",
+            notFound,
+            config.EnableImdbFallback);
+
         if (config.EnableImdbFallback)
         {
             _logger.LogInformation("Looking up {Count} not-found items via IMDb fallback", fallbackItems.Count);
@@ -274,6 +284,8 @@ public class RefreshImdbRatingsTask : IScheduledTask
 
                 pendingUpdates.Add((fallbackItem.Item, fallbackItem.Parent, fallbackItem.Item.CommunityRating, imdbRating.Value.Rating));
                 fallbackFound++;
+                // Remove from dash set since we found a rating
+                itemsToApplyDash.Remove(fallbackItem.Item.Id);
             }
 
             _logger.LogInformation(
@@ -282,6 +294,58 @@ public class RefreshImdbRatingsTask : IScheduledTask
                 fallbackNotFound,
                 fallbackBelowMinimumVotes,
                 fallbackUnchanged);
+        }
+
+        // Apply dash (null rating) to items where no IMDb rating was found
+        if (itemsToApplyDash.Count > 0)
+        {
+            _logger.LogInformation(
+                "Processing {Count} items with no IMDb rating: will clear existing ratings and set to null",
+                itemsToApplyDash.Count);
+
+            int debugItemsLogged = 0;
+            for (int i = 0; i < fallbackItems.Count; i++)
+            {
+                var fallbackItem = fallbackItems[i];
+                if (itemsToApplyDash.Contains(fallbackItem.Item.Id))
+                {
+                    // Check if the rating is already null/empty to avoid unnecessary updates
+                    if (fallbackItem.Item.CommunityRating.HasValue)
+                    {
+                        var itemName = fallbackItem.Item.Name;
+                        var itemType = fallbackItem.Item.GetType().Name;
+                        var oldRating = fallbackItem.Item.CommunityRating.Value;
+
+                        _logger.LogInformation(
+                            "Clearing {ItemType} rating: \"{ItemName}\" — old rating {OldRating} → null (no IMDb rating available)",
+                            itemType,
+                            itemName,
+                            oldRating);
+
+                        if (enableItemDebugLogging && debugItemsLogged < 20)
+                        {
+                            debugItemsLogged++;
+                            _logger.LogDebug("Detailed: {ItemType} \"{ItemName}\" (ID: {ItemId}) — old rating {OldRating} → null", itemType, itemName, fallbackItem.Item.Id, oldRating);
+                        }
+
+                        pendingUpdates.Add((fallbackItem.Item, fallbackItem.Parent, fallbackItem.Item.CommunityRating, null));
+                        noRatingDashApplied++;
+                    }
+                }
+            }
+
+            if (noRatingDashApplied > 0)
+            {
+                _logger.LogInformation(
+                    "Queued {Count} items for rating clear — these will be updated to null (no rating)",
+                    noRatingDashApplied);
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "No items needed rating updates — all {Count} items without IMDb ratings already have null/empty rating",
+                    itemsToApplyDash.Count);
+            }
         }
 
         // Step 4.5: Process Shoko-resolved items against the flat-file ratings.
@@ -408,8 +472,9 @@ public class RefreshImdbRatingsTask : IScheduledTask
         progress.Report(100);
         var skippedTotal = skippedMissingImdbId + skippedBelowMinimumVotes + skippedUnchanged;
         _logger.LogInformation(
-            "IMDb ratings refresh complete: {Updated} updated, {Skipped} skipped ({Unchanged} unchanged, {BelowMinimum} below minimum votes, {MissingImdbId} missing IMDb ID), {NotFound} not found in IMDb ratings",
+            "IMDb ratings refresh complete: {Updated} updated (including {DashApplied} with no rating), {Skipped} skipped ({Unchanged} unchanged, {BelowMinimum} below minimum votes, {MissingImdbId} missing IMDb ID), {NotFound} not found in IMDb ratings",
             pendingUpdates.Count,
+            noRatingDashApplied,
             skippedTotal,
             skippedUnchanged,
             skippedBelowMinimumVotes,
