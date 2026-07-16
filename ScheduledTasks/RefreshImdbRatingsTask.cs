@@ -239,6 +239,12 @@ public class RefreshImdbRatingsTask : IScheduledTask
             }
         }
 
+        // Log diagnostic info about items not found in ratings file
+        _logger.LogInformation(
+            "Items not found in IMDb ratings file: {NotFoundCount}, EnableImdbFallback: {FallbackEnabled}",
+            notFound,
+            config.EnableImdbFallback);
+
         if (config.EnableImdbFallback)
         {
             _logger.LogInformation("Looking up {Count} not-found items via IMDb fallback", fallbackItems.Count);
@@ -293,8 +299,11 @@ public class RefreshImdbRatingsTask : IScheduledTask
         // Apply dash (null rating) to items where no IMDb rating was found
         if (itemsToApplyDash.Count > 0)
         {
-            _logger.LogInformation("Applying dash rating to {Count} items with no IMDb rating found", itemsToApplyDash.Count);
+            _logger.LogInformation(
+                "Processing {Count} items with no IMDb rating: will clear existing ratings and set to null",
+                itemsToApplyDash.Count);
 
+            int debugItemsLogged = 0;
             for (int i = 0; i < fallbackItems.Count; i++)
             {
                 var fallbackItem = fallbackItems[i];
@@ -303,9 +312,20 @@ public class RefreshImdbRatingsTask : IScheduledTask
                     // Check if the rating is already null/empty to avoid unnecessary updates
                     if (fallbackItem.Item.CommunityRating.HasValue)
                     {
-                        if (enableItemDebugLogging)
+                        var itemName = fallbackItem.Item.Name;
+                        var itemType = fallbackItem.Item.GetType().Name;
+                        var oldRating = fallbackItem.Item.CommunityRating.Value;
+
+                        _logger.LogInformation(
+                            "Clearing {ItemType} rating: \"{ItemName}\" — old rating {OldRating} → null (no IMDb rating available)",
+                            itemType,
+                            itemName,
+                            oldRating);
+
+                        if (enableItemDebugLogging && debugItemsLogged < 20)
                         {
-                            _logger.LogDebug("Applying dash rating to \"{Name}\" — no IMDb rating available", fallbackItem.Item.Name);
+                            debugItemsLogged++;
+                            _logger.LogDebug("Detailed: {ItemType} \"{ItemName}\" (ID: {ItemId}) — old rating {OldRating} → null", itemType, itemName, fallbackItem.Item.Id, oldRating);
                         }
 
                         pendingUpdates.Add((fallbackItem.Item, fallbackItem.Parent, fallbackItem.Item.CommunityRating, null));
@@ -316,7 +336,15 @@ public class RefreshImdbRatingsTask : IScheduledTask
 
             if (noRatingDashApplied > 0)
             {
-                _logger.LogInformation("Queued {Count} items for dash rating update", noRatingDashApplied);
+                _logger.LogInformation(
+                    "Queued {Count} items for rating clear — these will be updated to null (no rating)",
+                    noRatingDashApplied);
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "No items needed rating updates — all {Count} items without IMDb ratings already have null/empty rating",
+                    itemsToApplyDash.Count);
             }
         }
 
