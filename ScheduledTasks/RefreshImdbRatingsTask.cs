@@ -303,6 +303,11 @@ public class RefreshImdbRatingsTask : IScheduledTask
                     // Check if the rating is already null/empty to avoid unnecessary updates
                     if (fallbackItem.Item.CommunityRating.HasValue)
                     {
+                        if (enableItemDebugLogging)
+                        {
+                            _logger.LogDebug("Applying dash rating to \"{Name}\" — no IMDb rating available", fallbackItem.Item.Name);
+                        }
+
                         pendingUpdates.Add((fallbackItem.Item, fallbackItem.Parent, fallbackItem.Item.CommunityRating, null));
                         noRatingDashApplied++;
                     }
