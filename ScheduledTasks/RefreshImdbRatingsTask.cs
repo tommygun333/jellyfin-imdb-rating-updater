@@ -295,15 +295,15 @@ public class RefreshImdbRatingsTask : IScheduledTask
         {
             _logger.LogInformation("Applying dash rating to {Count} items with no IMDb rating found", itemsToApplyDash.Count);
 
-            for (int i = 0; i < items.Count; i++)
+            for (int i = 0; i < fallbackItems.Count; i++)
             {
-                var item = items[i];
-                if (itemsToApplyDash.Contains(item.Id))
+                var fallbackItem = fallbackItems[i];
+                if (itemsToApplyDash.Contains(fallbackItem.Item.Id))
                 {
                     // Check if the rating is already null/empty to avoid unnecessary updates
-                    if (item.CommunityRating.HasValue)
+                    if (fallbackItem.Item.CommunityRating.HasValue)
                     {
-                        pendingUpdates.Add((item, item.GetParent(), item.CommunityRating, null));
+                        pendingUpdates.Add((fallbackItem.Item, fallbackItem.Parent, fallbackItem.Item.CommunityRating, null));
                         noRatingDashApplied++;
                     }
                 }
