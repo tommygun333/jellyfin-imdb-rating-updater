@@ -4,14 +4,14 @@
     "guid": "f5a3c7e1-9b2d-4f6a-8e0c-1d3b5a7c9e2f",
     "name": "IMDb Ratings",
     "description": "Downloads the IMDb ratings flat file daily and updates CommunityRating on all library items with an IMDb ID, without touching any other metadata.",
-    "owner": "voc0der",
+    "owner": "tommygun333", 
     "overview": "Scheduled task that keeps Jellyfin community ratings in sync with IMDb",
     "versions": [
       {
         "version": "1.0.0.20",
-        "changelog": "## What's Changed\n\n- Add support for clearing non-IMDb ratings when no IMDb rating is found\n- Improve logging for items with dash ratings\n\n**Full Changelog**: https://github.com/tommygun333/jellyfin-imdb-rating-updater/compare/1.0.0.19...1.0.0.20\n",
+        "changelog": "Your changelog here",
         "targetAbi": "10.11.6.0",
-        "sourceUrl": "https://github.com/tommygun333/jellyfin-imdb-rating-updater/releases/download/1.0.0.20/IMDb_Ratings_1.0.0.20.zip",
+        "sourceUrl": "https://github.com/tommygun333/jellyfin-imdb-rating-updater/releases/download/12345/Jellyfin.Plugin.ImdbRatings.zip",
         "checksum": "PLACEHOLDER",
         "timestamp": "2026-07-16T16:21:18Z"
       },
