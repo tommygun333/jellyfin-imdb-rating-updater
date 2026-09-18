@@ -61,6 +61,10 @@ public class ImdbGraphqlClient
             request.Headers.TryAddWithoutValidation("accept", "application/graphql+json, application/json");
             request.Headers.TryAddWithoutValidation("accept-language", "en-US,en;q=0.9");
             request.Headers.TryAddWithoutValidation("origin", "https://www.imdb.com");
+            request.Headers.TryAddWithoutValidation("referer", "https://www.imdb.com/");
+            request.Headers.TryAddWithoutValidation("x-imdb-client-name", "imdb-web-next");
+            request.Headers.TryAddWithoutValidation("x-imdb-user-language", "en-US");
+            request.Headers.TryAddWithoutValidation("x-imdb-user-country", "US");
             request.Headers.TryAddWithoutValidation(
                 "user-agent",
                 "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36");
